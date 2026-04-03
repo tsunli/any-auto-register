@@ -152,7 +152,7 @@ def _auto_upload_integrations(task_id: str, account):
             name = result.get("name", "Auto Upload")
             ok = bool(result.get("ok"))
             msg = result.get("msg", "")
-            _log(task_id, f"  [{name}] {'✓ ' + msg if ok else '✗ ' + msg}")
+            _log(task_id, f"  [{name}] {'[OK] ' + msg if ok else '[FAIL] ' + msg}")
     except Exception as e:
         _log(task_id, f"  [Auto Upload] 自动导入异常: {e}")
 
@@ -292,7 +292,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 saved_account = save_account(account)
                 if _proxy:
                     proxy_pool.report_success(_proxy)
-                _log(task_id, f"✓ 注册成功: {account.email}")
+                _log(task_id, f"[OK] 注册成功: {account.email}")
                 _save_task_log(req.platform, account.email, "success")
                 _auto_upload_integrations(task_id, saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
@@ -301,7 +301,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     _task_store.add_cashier_url(task_id, cashier_url)
                 return AttemptResult.success()
             except SkipCurrentAttemptRequested as e:
-                _log(task_id, f"↷ 已跳过当前账号: {e}")
+                _log(task_id, f"[SKIP] 已跳过当前账号: {e}")
                 _save_task_log(
                     req.platform,
                     current_email,
@@ -310,12 +310,12 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 )
                 return AttemptResult.skipped(str(e))
             except StopTaskRequested as e:
-                _log(task_id, f"■ {e}")
+                _log(task_id, f"[STOP] {e}")
                 return AttemptResult.stopped(str(e))
             except Exception as e:
                 if _proxy and proxy_pool is not None:
                     proxy_pool.report_fail(_proxy)
-                _log(task_id, f"✗ 注册失败: {e}")
+                _log(task_id, f"[FAIL] 注册失败: {e}")
                 _save_task_log(
                     req.platform,
                     current_email,
@@ -338,7 +338,7 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 except CancelledError:
                     continue
                 except Exception as e:
-                    _log(task_id, f"✗ 任务线程异常: {e}")
+                    _log(task_id, f"[ERROR] 任务线程异常: {e}")
                     errors.append(str(e))
                     continue
                 if result.outcome == AttemptOutcome.SUCCESS:
