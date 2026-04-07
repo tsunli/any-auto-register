@@ -1,5 +1,5 @@
 from .base import BaseMailImportStrategy
-from .providers import AppleMailImportStrategy, OutlookImportStrategy
+from .providers import AppleMailImportStrategy, OutlookImportStrategy, ForwardMailImportStrategy
 from .schemas import MailImportProviderDescriptor
 
 
@@ -31,5 +31,6 @@ mail_import_registry = MailImportRegistry(
     strategies=[
         AppleMailImportStrategy(),
         OutlookImportStrategy(),
+        ForwardMailImportStrategy(),
     ]
 )

@@ -19,13 +19,16 @@ import { apiFetch } from '@/lib/utils'
 
 function resolveEffectiveMailProvider(mailProvider: string, mailImportSource: string) {
   if (mailProvider !== 'mail_import') return mailProvider
-  return mailImportSource === 'applemail' ? 'applemail' : 'microsoft'
+  if (mailImportSource === 'applemail') return 'applemail'
+  if (mailImportSource === 'forwardmail') return 'forwardmail'
+  return 'microsoft'
 }
 
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
     { label: 'LuckMail（订单接码 / 已购邮箱）', value: 'luckmail' },
     { label: '邮箱导入', value: 'mail_import' },
+    { label: '转发邮箱（iCloud -> Gmail）', value: 'forwardmail' },
     { label: 'Laoudo（固定邮箱）', value: 'laoudo' },
     { label: 'TempMail.lol（自动生成）', value: 'tempmail_lol' },
     { label: 'SkyMail（CloudMail 接口）', value: 'skymail' },
@@ -236,6 +239,18 @@ const TAB_ITEMS = [
           { key: 'luckmail_domain', label: '邮箱域名（可选）', placeholder: 'outlook.com / gmail.com' },
         ],
       },
+      {
+        title: '转发邮箱 (iCloud -> Gmail)',
+        desc: 'iCloud 批量转发到统一 Gmail，通过 IMAP 搜索特定收件人的邮件（支持在本页直接导入 iCloud 列表）',
+        fields: [
+          { key: 'forward_gmail_host', label: 'Gmail IMAP Host', placeholder: 'imap.gmail.com' },
+          { key: 'forward_gmail_port', label: 'Gmail IMAP Port', placeholder: '993' },
+          { key: 'forward_gmail_user', label: 'Gmail 账号', placeholder: 'your-receiving-gmail@gmail.com' },
+          { key: 'forward_gmail_pass', label: 'Gmail 应用专用密码', secret: true, placeholder: '16 位应用专用密码' },
+          { key: 'forwardmail_pool_dir', label: '邮箱池目录', placeholder: 'mail' },
+          { key: 'forwardmail_pool_file', label: '当前邮箱池文件（可选）', placeholder: '留空则自动读取目录中最新文件' },
+        ],
+      },
     ],
   },
   {
@@ -429,6 +444,7 @@ const MAILBOX_SECTION_FIELD_KEY_BY_PROVIDER: Record<string, string> = {
   duckmail: 'duckmail_api_url',
   cfworker: 'cfworker_api_url',
   luckmail: 'luckmail_base_url',
+  forwardmail: 'forward_gmail_user',
 }
 
 const MAILBOX_SECTION_INDEX_BY_PROVIDER: Record<string, number> = {
@@ -1641,6 +1657,15 @@ export default function Settings() {
       if (!data.luckmail_base_url) {
         data.luckmail_base_url = 'https://mails.luckyous.com/'
       }
+      if (!data.forward_gmail_host) {
+        data.forward_gmail_host = 'imap.gmail.com'
+      }
+      if (!data.forward_gmail_port) {
+        data.forward_gmail_port = '993'
+      }
+      if (!data.forwardmail_pool_dir) {
+        data.forwardmail_pool_dir = 'mail'
+      }
       if (!String(data.contribution_enabled ?? '').trim()) {
         data.contribution_enabled = false
       }
@@ -1663,7 +1688,13 @@ export default function Settings() {
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       data.cfworker_random_name_subdomain = parseBooleanConfigValue(data.cfworker_random_name_subdomain)
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
-      data.mail_import_source = configMailProvider === 'applemail' ? 'applemail' : 'microsoft'
+      if (configMailProvider === 'applemail') {
+        data.mail_import_source = 'applemail'
+      } else if (configMailProvider === 'forwardmail') {
+        data.mail_import_source = 'forwardmail'
+      } else {
+        data.mail_import_source = 'microsoft'
+      }
       data.mail_provider = isMailImportProvider ? 'mail_import' : configMailProvider
       form.setFieldsValue(data)
     })
@@ -1729,9 +1760,13 @@ export default function Settings() {
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
+      let mailImportSource = 'microsoft'
+      if (values.mail_provider === 'applemail') mailImportSource = 'applemail'
+      else if (values.mail_provider === 'forwardmail') mailImportSource = 'forwardmail'
+
       form.setFieldsValue({
         mail_provider: values.mail_provider === 'microsoft' || values.mail_provider === 'applemail' ? 'mail_import' : values.mail_provider,
-        mail_import_source: values.mail_provider === 'applemail' ? 'applemail' : 'microsoft',
+        mail_import_source: mailImportSource,
         cpa_enabled: values.cpa_enabled,
         sub2api_enabled: values.sub2api_enabled,
         cfworker_domains: domains,

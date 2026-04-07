@@ -319,6 +319,16 @@ def create_mailbox(
             custom_auth=extra.get("cfworker_custom_auth", ""),
             proxy=proxy,
         )
+    elif provider == "forwardmail":
+        return ForwardMailbox(
+            gmail_user=extra.get("forward_gmail_user", ""),
+            gmail_pass=extra.get("forward_gmail_pass", ""),
+            gmail_host=extra.get("forward_gmail_host", "imap.gmail.com"),
+            gmail_port=extra.get("forward_gmail_port", 993),
+            pool_file=extra.get("forwardmail_pool_file", ""),
+            pool_dir=extra.get("forwardmail_pool_dir", "mail"),
+            proxy=proxy,
+        )
     elif provider == "luckmail":
         return LuckMailMailbox(
             base_url=extra.get("luckmail_base_url") or "https://mails.luckyous.com/",
@@ -4109,3 +4119,172 @@ class FreemailMailbox(BaseMailbox):
             poll_interval=3,
             poll_once=poll_once,
         )
+
+
+class ForwardMailbox(BaseMailbox):
+    """转发邮箱服务（如 iCloud 批量转发到 Gmail），通过 IMAP 登录目标邮箱搜索特定收件人的邮件"""
+
+    def __init__(
+        self,
+        gmail_user: str,
+        gmail_pass: str,
+        gmail_host: str = "imap.gmail.com",
+        gmail_port: int | str = 993,
+        pool_file: str = "",
+        pool_dir: str = "mail",
+        proxy: str = None,
+    ):
+        self.gmail_user = str(gmail_user or "").strip()
+        self.gmail_pass = str(gmail_pass or "").strip()
+        self.gmail_host = str(gmail_host or "imap.gmail.com").strip()
+        try:
+            self.gmail_port = int(gmail_port or 993)
+        except (TypeError, ValueError):
+            self.gmail_port = 993
+        self.pool_file = str(pool_file or "").strip()
+        self.pool_dir = str(pool_dir or "mail").strip() or "mail"
+        self.proxy = build_requests_proxy_config(proxy)
+        self._email = None
+
+    def _open_imap(self):
+        import imaplib
+        if not self.gmail_user or not self.gmail_pass:
+            raise RuntimeError("转发邮箱（Gmail）未配置账号或密码")
+
+        try:
+            # TODO: 支持代理 (imaplib 不原生支持)
+            conn = imaplib.IMAP4_SSL(self.gmail_host, self.gmail_port, timeout=30)
+            conn.login(self.gmail_user, self.gmail_pass)
+            return conn
+        except Exception as exc:
+            raise RuntimeError(f"转发邮箱 IMAP 登录失败 ({self.gmail_host}): {exc}")
+
+    def get_email(self) -> MailboxAccount:
+        from .forwardmail_pool import take_next_forwardmail_record
+
+        pool_path, record = take_next_forwardmail_record(
+            pool_file=self.pool_file,
+            pool_dir=self.pool_dir,
+        )
+        self._email = record["email"]
+        self._log(f"[ForwardMail] 使用邮箱池: {pool_path.name}")
+        self._log(f"[ForwardMail] 分配邮箱: {record['email']}")
+        return MailboxAccount(
+            email=record["email"],
+            account_id=record["email"],
+            extra={
+                "provider": "forwardmail",
+                "pool_file": pool_path.name,
+            },
+        )
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        import imaplib
+        try:
+            conn = self._open_imap()
+            try:
+                conn.select("INBOX", readonly=True)
+                # 搜索发送给该 iCloud 邮箱的邮件
+                # 注意：转发后的邮件，To 字段通常还是原本的 iCloud 地址
+                typ, data = conn.search(None, f'(TO "{account.email}")')
+                if typ != "OK":
+                    return set()
+                return set(data[0].split())
+            finally:
+                try:
+                    conn.close()
+                    conn.logout()
+                except Exception:
+                    pass
+        except Exception as exc:
+            self._log(f"[ForwardMail] 获取当前邮件 ID 失败: {exc}")
+            return set()
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+        **kwargs,
+    ) -> str:
+        seen = set(before_ids or [])
+
+        def poll_once() -> Optional[str]:
+            import email
+            try:
+                conn = self._open_imap()
+                try:
+                    conn.select("INBOX", readonly=True)
+                    # 搜索最近邮件
+                    typ, data = conn.search(None, f'(TO "{account.email}")')
+                    if typ != "OK":
+                        return None
+
+                    msg_ids = data[0].split()
+                    # 从新到旧检查
+                    for mid in reversed(msg_ids):
+                        if mid in seen:
+                            continue
+                        seen.add(mid)
+
+                        typ, msg_data = conn.fetch(mid, "(RFC822)")
+                        if typ != "OK":
+                            continue
+
+                        raw_email = msg_data[0][1]
+                        msg = email.message_from_bytes(raw_email)
+                        
+                        # 检查关键字
+                        subject = self._decode_header_value(msg.get("Subject", ""))
+                        body = self._extract_message_text(msg)
+                        text = f"{subject} {body}"
+                        
+                        if keyword and keyword.lower() not in text.lower():
+                            continue
+                        
+                        code = self._safe_extract(text, code_pattern)
+                        if code:
+                            self._log(f"[ForwardMail] 收到验证码: {code}")
+                            return code
+                finally:
+                    try:
+                        conn.logout()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                self._log(f"[ForwardMail] 轮询异常: {exc}")
+            return None
+
+        return self._run_polling_wait(
+            timeout=timeout,
+            poll_interval=3,
+            poll_once=poll_once,
+        )
+
+    def _decode_header_value(self, value: str) -> str:
+        from email.header import decode_header
+        if not value: return ""
+        parts = decode_header(value)
+        decoded = []
+        for part, charset in parts:
+            if isinstance(part, bytes):
+                decoded.append(part.decode(charset or "utf-8", errors="ignore"))
+            else:
+                decoded.append(str(part))
+        return "".join(decoded)
+
+    def _extract_message_text(self, msg) -> str:
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() in ["text/plain", "text/html"]:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or "utf-8"
+                    body += payload.decode(charset, errors="ignore")
+        else:
+            payload = msg.get_payload(decode=True)
+            charset = msg.get_content_charset() or "utf-8"
+            body = payload.decode(charset, errors="ignore")
+        return body

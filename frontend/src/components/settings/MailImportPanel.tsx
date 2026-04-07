@@ -4,7 +4,7 @@ import type { FormInstance } from 'antd'
 
 import { apiFetch } from '@/lib/utils'
 
-type MailImportProviderType = 'applemail' | 'microsoft'
+type MailImportProviderType = 'applemail' | 'microsoft' | 'forwardmail'
 type MailImportSelectionType = MailImportProviderType | 'outlook' | 'hotmail'
 type MailImportFormProviderType = MailImportProviderType | 'mail_import'
 
@@ -62,8 +62,8 @@ interface MailImportResult {
   meta: Record<string, unknown>
 }
 
-const SUPPORTED_IMPORT_TYPES: MailImportProviderType[] = ['applemail', 'microsoft']
-const SUPPORTED_SELECTION_TYPES: MailImportSelectionType[] = ['applemail', 'microsoft', 'outlook', 'hotmail']
+const SUPPORTED_IMPORT_TYPES: MailImportProviderType[] = ['applemail', 'microsoft', 'forwardmail']
+const SUPPORTED_SELECTION_TYPES: MailImportSelectionType[] = ['applemail', 'microsoft', 'outlook', 'hotmail', 'forwardmail']
 
 function isSupportedImportType(value: string): value is MailImportProviderType {
   return SUPPORTED_IMPORT_TYPES.includes(value as MailImportProviderType)
@@ -74,7 +74,9 @@ function isSupportedSelectionType(value: string): value is MailImportSelectionTy
 }
 
 function toImportApiType(value: MailImportSelectionType): MailImportProviderType {
-  return value === 'applemail' ? 'applemail' : 'microsoft'
+  if (value === 'applemail') return 'applemail'
+  if (value === 'forwardmail') return 'forwardmail'
+  return 'microsoft'
 }
 
 function resolveMicrosoftImportType(domain: string) {
@@ -89,9 +91,12 @@ function resolvePreferredImportType(
   applemailPoolFile: string,
 ): MailImportSelectionType {
   if (currentMailProvider === 'mail_import') {
-    return mailImportSource === 'applemail' ? 'applemail' : resolveMicrosoftImportType(String(luckmailDomain || '').trim().toLowerCase())
+    if (mailImportSource === 'applemail') return 'applemail'
+    if (mailImportSource === 'forwardmail') return 'forwardmail'
+    return resolveMicrosoftImportType(String(luckmailDomain || '').trim().toLowerCase())
   }
   if (currentMailProvider === 'applemail') return 'applemail'
+  if (currentMailProvider === 'forwardmail') return 'forwardmail'
   if (currentMailProvider === 'microsoft' || currentMailProvider === 'outlook') {
     return resolveMicrosoftImportType(String(luckmailDomain || '').trim().toLowerCase())
   }
@@ -124,6 +129,16 @@ function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
         type: 'applemail',
         apiType: 'applemail',
         label: 'AppleMail / 小苹果',
+      })
+      continue
+    }
+
+    if (provider.type === 'forwardmail') {
+      items.push({
+        ...provider,
+        type: 'forwardmail',
+        apiType: 'forwardmail',
+        label: '转发邮箱 (iCloud -> Gmail)',
       })
       continue
     }
@@ -183,7 +198,7 @@ function filterSnapshotBySelection(
 }
 
 function buildImportSuccessMessage(result: MailImportResult) {
-  if (result.type === 'applemail') {
+  if (result.type === 'applemail' || result.type === 'forwardmail') {
     const fileLabel = result.snapshot.filename ? `，已绑定 ${result.snapshot.filename}` : ''
     return `导入成功，共 ${result.summary.success} 个邮箱${fileLabel}`
   }
@@ -203,6 +218,8 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   const currentMailImportSource = String(Form.useWatch('mail_import_source', form) || 'microsoft')
   const watchedPoolDir = String(Form.useWatch('applemail_pool_dir', form) || 'mail')
   const watchedPoolFile = String(Form.useWatch('applemail_pool_file', form) || '')
+  const watchedForwardPoolDir = String(Form.useWatch('forwardmail_pool_dir', form) || 'mail')
+  const watchedForwardPoolFile = String(Form.useWatch('forwardmail_pool_file', form) || '')
   const watchedLuckmailEmailType = String(Form.useWatch('luckmail_email_type', form) || '')
   const watchedLuckmailDomain = String(Form.useWatch('luckmail_domain', form) || '')
 
@@ -279,6 +296,13 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         if (watchedPoolFile.trim()) {
           params.set('pool_file', watchedPoolFile.trim())
         }
+      } else if (apiType === 'forwardmail') {
+        if (watchedForwardPoolDir.trim()) {
+          params.set('pool_dir', watchedForwardPoolDir.trim())
+        }
+        if (watchedForwardPoolFile.trim()) {
+          params.set('pool_file', watchedForwardPoolFile.trim())
+        }
       }
       const nextSnapshot = await apiFetch(`/mail-imports/snapshot?${params.toString()}`) as MailImportSnapshot
       setRawSnapshot(nextSnapshot)
@@ -302,7 +326,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   useEffect(() => {
     if (!selectedProvider) return
     void loadSnapshot(selectedType)
-  }, [selectedProvider, selectedType, watchedPoolDir, watchedPoolFile])
+  }, [selectedProvider, selectedType, watchedPoolDir, watchedPoolFile, watchedForwardPoolDir, watchedForwardPoolFile])
 
   useEffect(() => {
     setSelectedRowKeys([])
@@ -328,6 +352,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       if (apiType === 'applemail') {
         body.filename = filename.trim()
         body.pool_dir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
+      } else if (apiType === 'forwardmail') {
+        body.filename = filename.trim()
+        body.pool_dir = String(form.getFieldValue('forwardmail_pool_dir') || 'mail').trim() || 'mail'
       }
 
       const response = await apiFetch('/mail-imports', {
@@ -352,6 +379,13 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
           mail_provider: 'mail_import',
           mail_import_source: 'microsoft',
         })
+      } else if (response.type === 'forwardmail') {
+        form.setFieldsValue({
+          mail_provider: 'mail_import',
+          mail_import_source: 'forwardmail',
+          forwardmail_pool_dir: response.snapshot.pool_dir,
+          forwardmail_pool_file: response.snapshot.filename,
+        })
       }
 
       message.success(buildImportSuccessMessage(response))
@@ -367,7 +401,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     setSelectedType(value)
     form.setFieldsValue({
       mail_provider: 'mail_import',
-      mail_import_source: value === 'applemail' ? 'applemail' : 'microsoft',
+      mail_import_source: value === 'applemail' ? 'applemail' : (value === 'forwardmail' ? 'forwardmail' : 'microsoft'),
     })
   }
 
@@ -387,6 +421,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         body.mailbox = item.mailbox || ''
         body.pool_dir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
         body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
+      } else if (apiType === 'forwardmail') {
+        body.pool_dir = String(form.getFieldValue('forwardmail_pool_dir') || 'mail').trim() || 'mail'
+        body.pool_file = String(form.getFieldValue('forwardmail_pool_file') || '').trim()
       }
 
       const response = await apiFetch('/mail-imports/delete', {
@@ -432,6 +469,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       if (apiType === 'applemail') {
         body.pool_dir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
         body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
+      } else if (apiType === 'forwardmail') {
+        body.pool_dir = String(form.getFieldValue('forwardmail_pool_dir') || 'mail').trim() || 'mail'
+        body.pool_file = String(form.getFieldValue('forwardmail_pool_file') || '').trim()
       }
 
       const response = await apiFetch('/mail-imports/batch-delete', {
@@ -467,6 +507,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             body.mailbox = item.mailbox || ''
             body.pool_dir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
             body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
+          } else if (apiType === 'forwardmail') {
+            body.pool_dir = String(form.getFieldValue('forwardmail_pool_dir') || 'mail').trim() || 'mail'
+            body.pool_file = String(form.getFieldValue('forwardmail_pool_file') || '').trim()
           }
 
           const response = await apiFetch('/mail-imports/delete', {
@@ -514,9 +557,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       },
     ]
 
-    if (selectedType === 'applemail') {
+    if (selectedType === 'applemail' || selectedType === 'forwardmail') {
       baseColumns.push({
-        title: '邮箱文件夹',
+        title: '分发表',
         dataIndex: 'mailbox',
         key: 'mailbox',
         width: 140,
@@ -651,11 +694,11 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <Tag color="blue">
-            {selectedType === 'applemail'
+            {selectedType === 'applemail' || selectedType === 'forwardmail'
               ? `已导入: ${snapshot?.count || 0} 个邮箱`
               : `当前预览匹配: ${snapshot?.items.length || 0}${rawSnapshot?.truncated ? ` / 总池 ${rawSnapshot?.count || 0}` : ''}`}
           </Tag>
-          {selectedType === 'applemail' && snapshot?.filename ? (
+          {(selectedType === 'applemail' || selectedType === 'forwardmail') && snapshot?.filename ? (
             <Typography.Text type="secondary">当前文件: {snapshot.filename}</Typography.Text>
           ) : null}
           {snapshot?.items?.length ? (

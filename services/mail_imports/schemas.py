@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-MailImportProviderType = Literal["applemail", "microsoft"]
+MailImportProviderType = Literal["applemail", "microsoft", "forwardmail"]
 
 DEFAULT_PREVIEW_LIMIT = 100
 MAX_PREVIEW_LIMIT = 500

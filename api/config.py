@@ -45,6 +45,12 @@ CONFIG_KEYS = [
     "applemail_pool_dir",
     "applemail_pool_file",
     "applemail_mailboxes",
+    "forward_gmail_host",
+    "forward_gmail_port",
+    "forward_gmail_user",
+    "forward_gmail_pass",
+    "forwardmail_pool_dir",
+    "forwardmail_pool_file",
     "gptmail_base_url",
     "gptmail_api_key",
     "gptmail_domain",
@@ -133,6 +139,12 @@ def get_config():
         all_cfg["gptmail_base_url"] = "https://mail.chatgpt.org.uk"
     if not all_cfg.get("luckmail_base_url"):
         all_cfg["luckmail_base_url"] = "https://mails.luckyous.com/"
+    if not all_cfg.get("forward_gmail_host"):
+        all_cfg["forward_gmail_host"] = "imap.gmail.com"
+    if not all_cfg.get("forward_gmail_port"):
+        all_cfg["forward_gmail_port"] = "993"
+    if not all_cfg.get("forwardmail_pool_dir"):
+        all_cfg["forwardmail_pool_dir"] = "mail"
     if not str(all_cfg.get("contribution_enabled", "") or "").strip():
         all_cfg["contribution_enabled"] = "0"
     if not all_cfg.get("contribution_server_url"):

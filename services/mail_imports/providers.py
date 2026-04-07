@@ -8,6 +8,11 @@ from core.applemail_pool import (
     load_applemail_pool_snapshot,
     save_applemail_pool_json,
 )
+from core.forwardmail_pool import (
+    load_forwardmail_pool_records,
+    load_forwardmail_pool_snapshot,
+    save_forwardmail_pool_json,
+)
 from core.config_store import config_store
 from core.db import OutlookAccountModel, engine
 
@@ -450,4 +455,199 @@ class OutlookImportStrategy(BaseMailImportStrategy):
             snapshot=snapshot,
             errors=errors,
             meta={"deleted_emails": deleted},
+        )
+
+
+class ForwardMailImportStrategy(BaseMailImportStrategy):
+    @property
+    def descriptor(self) -> MailImportProviderDescriptor:
+        return MailImportProviderDescriptor(
+            type="forwardmail",
+            label="转发邮箱 (iCloud -> Gmail)",
+            description="导入本地 iCloud 邮箱池文件，运行时按文件轮序邮箱并通过统一接收的 Gmail IMAP 拉取邮件。",
+            helper_text="支持数组/对象 JSON，也支持每行一个邮箱地址的 TXT 文件。",
+            content_placeholder=(
+                '[\n  {\n    "email": "demo@icloud.com"\n  }\n]\n\n'
+                "或粘贴 TXT:\ndemo1@icloud.com\ndemo2@icloud.com"
+            ),
+            supports_filename=True,
+            filename_label="邮箱池文件名",
+            filename_placeholder="可选文件名，例如 forward_icloud.json；留空自动生成",
+            preview_empty_text="当前还没有可预览的转发邮箱池内容。",
+        )
+
+    def get_snapshot(self, request: MailImportSnapshotRequest) -> MailImportSnapshot:
+        pool_dir = str(
+            request.pool_dir or config_store.get("forwardmail_pool_dir", "mail")
+        ).strip() or "mail"
+        pool_file = str(
+            request.pool_file or config_store.get("forwardmail_pool_file", "")
+        ).strip()
+        snapshot = load_forwardmail_pool_snapshot(
+            pool_file=pool_file,
+            pool_dir=pool_dir,
+            preview_limit=request.preview_limit,
+        )
+
+        items = [
+            MailImportSnapshotItem(
+                index=int(item.get("index") or 0),
+                email=str(item.get("email") or ""),
+                mailbox=str(item.get("mailbox") or "INBOX"),
+            )
+            for item in snapshot.get("items", [])
+        ]
+
+        return MailImportSnapshot(
+            type="forwardmail",
+            label=self.descriptor.label,
+            count=int(snapshot.get("count") or 0),
+            items=items,
+            truncated=bool(snapshot.get("truncated")),
+            filename=str(snapshot.get("filename") or ""),
+            path=str(snapshot.get("path") or ""),
+            pool_dir=pool_dir,
+        )
+
+    def execute(self, request: MailImportExecuteRequest) -> MailImportResponse:
+        pool_dir = str(
+            request.pool_dir or config_store.get("forwardmail_pool_dir", "mail")
+        ).strip() or "mail"
+        result = save_forwardmail_pool_json(
+            request.content,
+            pool_dir=pool_dir,
+            filename=request.filename,
+        )
+
+        if request.bind_to_config:
+            config_store.set_many(
+                {
+                    "forwardmail_pool_dir": pool_dir,
+                    "forwardmail_pool_file": result["filename"],
+                }
+            )
+
+        snapshot = self.get_snapshot(
+            MailImportSnapshotRequest(
+                type="forwardmail",
+                pool_dir=pool_dir,
+                pool_file=str(result["filename"]),
+                preview_limit=request.preview_limit,
+            )
+        )
+        return MailImportResponse(
+            type="forwardmail",
+            summary=MailImportSummary(
+                total=int(result["count"]),
+                success=int(result["count"]),
+                failed=0,
+            ),
+            snapshot=snapshot,
+            meta={
+                "bound_to_config": request.bind_to_config,
+                "path": str(result["path"]),
+            },
+        )
+
+    def delete(self, request: MailImportDeleteRequest) -> MailImportResponse:
+        pool_dir = str(
+            request.pool_dir or config_store.get("forwardmail_pool_dir", "mail")
+        ).strip() or "mail"
+        pool_file = str(
+            request.pool_file or config_store.get("forwardmail_pool_file", "")
+        ).strip()
+        path, records = load_forwardmail_pool_records(pool_file=pool_file, pool_dir=pool_dir)
+
+        target_email = str(request.email or "").strip().lower()
+        removed = None
+        remaining: list[dict[str, str]] = []
+
+        for record in records:
+            record_email = str(record.get("email") or "").strip().lower()
+            if removed is None and record_email == target_email:
+                removed = record
+                continue
+            remaining.append(record)
+
+        if removed is None:
+            raise RuntimeError(f"未找到要删除的转发邮箱: {request.email}")
+
+        path.write_text(
+            json.dumps(remaining, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        snapshot = self.get_snapshot(
+            MailImportSnapshotRequest(
+                type="forwardmail",
+                pool_dir=pool_dir,
+                pool_file=path.name,
+                preview_limit=request.preview_limit,
+            )
+        )
+        return MailImportResponse(
+            type="forwardmail",
+            summary=MailImportSummary(total=1, success=1, failed=0),
+            snapshot=snapshot,
+            meta={
+                "deleted_email": request.email,
+                "path": str(path),
+            },
+        )
+
+    def batch_delete(self, request: MailImportBatchDeleteRequest) -> MailImportResponse:
+        pool_dir = str(
+            request.pool_dir or config_store.get("forwardmail_pool_dir", "mail")
+        ).strip() or "mail"
+        pool_file = str(
+            request.pool_file or config_store.get("forwardmail_pool_file", "")
+        ).strip()
+        path, records = load_forwardmail_pool_records(pool_file=pool_file, pool_dir=pool_dir)
+
+        pending = [
+            str(item.email or "").strip().lower()
+            for item in request.items
+            if str(item.email or "").strip()
+        ]
+        deleted: list[str] = []
+        errors: list[str] = []
+        remaining: list[dict[str, str]] = []
+
+        for record in records:
+            record_email = str(record.get("email") or "").strip().lower()
+            if record_email in pending:
+                pending.remove(record_email)
+                deleted.append(record_email)
+                continue
+            remaining.append(record)
+
+        for email in pending:
+            errors.append(f"未找到要删除的转发邮箱: {email}")
+
+        path.write_text(
+            json.dumps(remaining, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        snapshot = self.get_snapshot(
+            MailImportSnapshotRequest(
+                type="forwardmail",
+                pool_dir=pool_dir,
+                pool_file=path.name,
+                preview_limit=request.preview_limit,
+            )
+        )
+        return MailImportResponse(
+            type="forwardmail",
+            summary=MailImportSummary(
+                total=len(request.items),
+                success=len(deleted),
+                failed=len(errors),
+            ),
+            snapshot=snapshot,
+            errors=errors,
+            meta={
+                "deleted_emails": deleted,
+                "path": str(path),
+            },
         )
