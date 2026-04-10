@@ -3258,10 +3258,6 @@ class OAuthClient:
                         break
                     continue
 
-                if code in tried_codes:
-                    self._log(f"跳过已尝试验证码: {code}")
-                    continue
-
                 next_state = validate_otp(code)
                 if next_state:
                     return next_state

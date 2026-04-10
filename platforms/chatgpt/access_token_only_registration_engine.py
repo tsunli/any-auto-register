@@ -30,7 +30,7 @@ class EmailServiceAdapter:
         code = self.es.get_verification_code(
             timeout=timeout,
             otp_sent_at=otp_sent_at,
-            exclude_codes=exclude_codes or self._used_codes,
+            exclude_codes=None,
         )
         if code:
             self._used_codes.add(code)

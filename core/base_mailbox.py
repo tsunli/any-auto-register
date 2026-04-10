@@ -4216,7 +4216,7 @@ class ForwardMailbox(BaseMailbox):
             try:
                 conn = self._open_imap()
                 try:
-                    conn.select("INBOX", readonly=True)
+                    conn.select("INBOX", readonly=False)
                     # 搜索最近邮件
                     typ, data = conn.search(None, f'(TO "{account.email}")')
                     if typ != "OK":
@@ -4247,6 +4247,13 @@ class ForwardMailbox(BaseMailbox):
                         code = self._safe_extract(text, code_pattern)
                         if code:
                             self._log(f"[ForwardMail] 收到验证码: {code}")
+                            # 删除已处理邮件，避免重复提取
+                            try:
+                                conn.store(mid, "+FLAGS", "\\Deleted")
+                                conn.expunge()
+                                self._log(f"[ForwardMail] 已删除邮件: {mid.decode()}")
+                            except Exception as e:
+                                self._log(f"[ForwardMail] 删除邮件失败: {e}")
                             return code
                 finally:
                     try:
