@@ -30,17 +30,23 @@ _KIRO_MANAGER_MSI_URL = (
     "https://github.com/hj01857655/kiro-account-manager/releases/download/"
     "v1.8.3/KiroAccountManager_1.8.3_x64_zh-CN.msi"
 )
+# v1.8.3/KiroAccountManager_1.8.3_aarch64.dmg"
 _KIRO_MANAGER_MSI = _EXT_ROOT / "KiroAccountManager_1.8.3_x64_zh-CN.msi"
 _KIRO_MANAGER_EXTRACT_DIR = _EXT_ROOT / "kiro-manager-msi-extract"
-_KIRO_MANAGER_EXTRACT_EXE = _KIRO_MANAGER_EXTRACT_DIR / "PFiles" / "KiroAccountManager" / "kiro-account-manager.exe"
+_KIRO_MANAGER_EXTRACT_EXE = (
+    _KIRO_MANAGER_EXTRACT_DIR
+    / "PFiles"
+    / "KiroAccountManager"
+    / "kiro-account-manager.exe"
+)
 
 _SERVICE_META = {
     "cliproxyapi": {
         "label": "CLIProxyAPI",
         "repo_name": "CLIProxyAPI",
-        "url": "http://127.0.0.1:8317",
-        "health": "http://127.0.0.1:8317/",
-        "management_url": "http://127.0.0.1:8317/management.html",
+        "url": "http://127.0.0.1:18317",
+        "health": "http://127.0.0.1:18317/",
+        "management_url": "http://127.0.0.1:18317/management.html",
         "port": 8317,
         "kind": "web",
     },
@@ -66,7 +72,9 @@ _PROCS: dict[str, subprocess.Popen] = {}
 _LOG_FILES: dict[str, Any] = {}
 _LAST_ERROR: dict[str, str] = {}
 _LOCK = threading.Lock()
-_SEMVER_TAG_PATTERN = re.compile(r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+_SEMVER_TAG_PATTERN = re.compile(
+    r"^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+)
 
 
 def _get_setting(key: str, default: str = "") -> str:
@@ -162,7 +170,15 @@ def _git_has_remote_branch(repo: Path, branch: str) -> bool:
     if not branch:
         return False
     check = subprocess.run(
-        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+        [
+            "git",
+            "-C",
+            str(repo),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/remotes/origin/{branch}",
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=_creationflags(),
@@ -173,7 +189,14 @@ def _git_has_remote_branch(repo: Path, branch: str) -> bool:
 def _origin_default_branch(repo: Path) -> str:
     try:
         out = subprocess.check_output(
-            ["git", "-C", str(repo), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            [
+                "git",
+                "-C",
+                str(repo),
+                "symbolic-ref",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ],
             text=True,
             creationflags=_creationflags(),
         ).strip()
@@ -372,9 +395,8 @@ def uninstall(name: str) -> dict[str, Any]:
                         pass
                     time.sleep(0.5)
             if repo.exists():
-                _LAST_ERROR[name] = (
-                    f"卸载失败：目录仍存在 {repo}"
-                    + (f"，原因：{last_exc}" if last_exc else "")
+                _LAST_ERROR[name] = f"卸载失败：目录仍存在 {repo}" + (
+                    f"，原因：{last_exc}" if last_exc else ""
                 )
                 raise RuntimeError(_LAST_ERROR[name])
         _PROCS.pop(name, None)
@@ -437,10 +459,20 @@ def _kiro_known_exe_paths() -> list[str]:
         pass
 
     for item in [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "KiroAccountManager" / "KiroAccountManager.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "KiroAccountManager" / "KiroAccountManager.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "kiro-account-manager" / "kiro-account-manager.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "kiro-account-manager" / "kiro-account-manager.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Programs"
+        / "KiroAccountManager"
+        / "KiroAccountManager.exe",
+        Path(os.environ.get("ProgramFiles", ""))
+        / "KiroAccountManager"
+        / "KiroAccountManager.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Programs"
+        / "kiro-account-manager"
+        / "kiro-account-manager.exe",
+        Path(os.environ.get("ProgramFiles", ""))
+        / "kiro-account-manager"
+        / "kiro-account-manager.exe",
         _KIRO_MANAGER_EXTRACT_EXE,
     ]:
         if item.exists():
@@ -503,7 +535,11 @@ def _status_one(name: str) -> dict[str, Any]:
     repo = _repo_path(name)
     proc = _PROCS.get(name)
     desktop_pid = _find_desktop_pid(name) if meta["kind"] == "desktop" else None
-    running = _health_ok(name) if meta["kind"] == "web" else bool(desktop_pid or _proc_running(name))
+    running = (
+        _health_ok(name)
+        if meta["kind"] == "web"
+        else bool(desktop_pid or _proc_running(name))
+    )
     pid = proc.pid if proc and proc.poll() is None else desktop_pid
     if meta["kind"] == "web" and running:
         pid = _find_pid_by_port(int(meta.get("port") or 0)) or pid
@@ -536,8 +572,26 @@ def list_status() -> list[dict[str, Any]]:
 def _find_go() -> str | None:
     candidates = [
         shutil.which("go"),
-        str(Path.home() / "go" / "pkg" / "mod" / "golang.org" / "toolchain@v0.0.1-go1.24.10.windows-amd64" / "bin" / "go.exe"),
-        str(Path.home() / "go" / "pkg" / "mod" / "golang.org" / "toolchain@v0.0.1-go1.24.0.windows-amd64" / "bin" / "go.exe"),
+        str(
+            Path.home()
+            / "go"
+            / "pkg"
+            / "mod"
+            / "golang.org"
+            / "toolchain@v0.0.1-go1.24.10.windows-amd64"
+            / "bin"
+            / "go.exe"
+        ),
+        str(
+            Path.home()
+            / "go"
+            / "pkg"
+            / "mod"
+            / "golang.org"
+            / "toolchain@v0.0.1-go1.24.0.windows-amd64"
+            / "bin"
+            / "go.exe"
+        ),
         r"C:\Program Files\Go\bin\go.exe",
     ]
     for item in candidates:
@@ -581,10 +635,20 @@ def _resolve_kiro_exe() -> str | None:
     except Exception:
         pass
     candidates = [
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "KiroAccountManager" / "KiroAccountManager.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "KiroAccountManager" / "KiroAccountManager.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "kiro-account-manager" / "kiro-account-manager.exe",
-        Path(os.environ.get("ProgramFiles", "")) / "kiro-account-manager" / "kiro-account-manager.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Programs"
+        / "KiroAccountManager"
+        / "KiroAccountManager.exe",
+        Path(os.environ.get("ProgramFiles", ""))
+        / "KiroAccountManager"
+        / "KiroAccountManager.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Programs"
+        / "kiro-account-manager"
+        / "kiro-account-manager.exe",
+        Path(os.environ.get("ProgramFiles", ""))
+        / "kiro-account-manager"
+        / "kiro-account-manager.exe",
         _KIRO_MANAGER_EXTRACT_EXE,
     ]
     for item in candidates:
@@ -654,13 +718,36 @@ def _ensure_grok2api_conda_env(repo: Path) -> str:
     marker = repo / ".grok2api-env-ready"
     if not marker.exists():
         subprocess.run(
-            [conda, "run", "--no-capture-output", "-n", env_name, "python", "-m", "pip", "install", "--upgrade", "pip"],
+            [
+                conda,
+                "run",
+                "--no-capture-output",
+                "-n",
+                env_name,
+                "python",
+                "-m",
+                "pip",
+                "install",
+                "--upgrade",
+                "pip",
+            ],
             cwd=str(repo),
             check=True,
             creationflags=_creationflags(),
         )
         subprocess.run(
-            [conda, "run", "--no-capture-output", "-n", env_name, "python", "-m", "pip", "install", "."],
+            [
+                conda,
+                "run",
+                "--no-capture-output",
+                "-n",
+                env_name,
+                "python",
+                "-m",
+                "pip",
+                "install",
+                ".",
+            ],
             cwd=str(repo),
             check=True,
             creationflags=_creationflags(),
@@ -726,7 +813,9 @@ def _ensure_grok2api_runtime_config(repo: Path):
 
     if not config_file.exists():
         if default_config.exists():
-            config_file.write_text(default_config.read_text(encoding="utf-8"), encoding="utf-8")
+            config_file.write_text(
+                default_config.read_text(encoding="utf-8"), encoding="utf-8"
+            )
         else:
             config_file.write_text("[app]\n", encoding="utf-8")
 
@@ -823,7 +912,9 @@ def _build_command(name: str) -> tuple[list[str], Path]:
             return [exe], repo
         cargo = shutil.which("cargo")
         if not cargo:
-            raise RuntimeError("未找到 Kiro Account Manager 可执行文件，且系统未安装 Rust/Cargo，无法从源码启动")
+            raise RuntimeError(
+                "未找到 Kiro Account Manager 可执行文件，且系统未安装 Rust/Cargo，无法从源码启动"
+            )
         return ["npm", "run", "tauri", "dev"], repo
 
     raise KeyError(name)
@@ -835,7 +926,9 @@ def start(name: str) -> dict[str, Any]:
             raise KeyError(name)
         repo = _repo_path(name)
         if not repo.exists():
-            raise RuntimeError(f"{_SERVICE_META[name]['label']} 未安装，请先在插件页点击“安装”")
+            raise RuntimeError(
+                f"{_SERVICE_META[name]['label']} 未安装，请先在插件页点击“安装”"
+            )
         if _status_one(name)["running"]:
             return _status_one(name)
 
