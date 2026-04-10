@@ -1705,6 +1705,10 @@ class OAuthClient:
         if force_new_browser:
             self._log("force_new_browser: 重新创建 OAuth 会话容器")
             self._recreate_session()
+            if skymail_client is not None:
+                skymail_client._used_codes = set()
+                skymail_client._failed_codes = set()
+                self._log("force_new_browser: 已重置 skymail_client OTP 状态")
             device_id = str(uuid.uuid4())
             self._log(f"force_new_browser: 新 device_id={device_id}")
         else:
@@ -3075,8 +3079,11 @@ class OAuthClient:
 
         if not hasattr(skymail_client, "_used_codes"):
             skymail_client._used_codes = set()
+        if not hasattr(skymail_client, "_failed_codes"):
+            skymail_client._failed_codes = set()
 
         tried_codes = set(getattr(skymail_client, "_used_codes", set()))
+        failed_codes = set(getattr(skymail_client, "_failed_codes", set()))
         try:
             otp_wait_seconds = int(
                 self.config.get(
@@ -3128,17 +3135,23 @@ class OAuthClient:
                 resp_otp = self.session.post(request_url, **kwargs)
             except Exception as e:
                 self._log(f"email-otp/validate 异常: {e}")
+                failed_codes.add(code)
+                skymail_client._failed_codes.add(code)
                 return None
 
             self._log(f"/email-otp/validate -> {resp_otp.status_code}")
             if resp_otp.status_code != 200:
                 self._log(f"OTP 无效: {resp_otp.text[:160]}")
+                failed_codes.add(code)
+                skymail_client._failed_codes.add(code)
                 return None
 
             try:
                 otp_data = resp_otp.json()
             except Exception:
                 self._log("email-otp/validate 响应不是 JSON")
+                failed_codes.add(code)
+                skymail_client._failed_codes.add(code)
                 return None
 
             next_state = self._state_from_payload(
@@ -3218,7 +3231,7 @@ class OAuthClient:
                         email,
                         timeout=wait_time,
                         otp_sent_at=otp_sent_at,
-                        exclude_codes=tried_codes,
+                        exclude_codes=failed_codes,
                     )
                 except TaskInterruption:
                     self._set_error("任务已手动停止")
