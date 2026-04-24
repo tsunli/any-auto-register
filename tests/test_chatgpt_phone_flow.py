@@ -156,6 +156,7 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         self.assertIsNone(state)
         phone_service.mark_blacklisted.assert_called_once_with(entry.phone)
         self.assertIn("add_phone 阶段失败", client.last_error)
+        self.assertEqual(client.last_error_code, "add_phone_verification_failed")
 
     def test_handle_add_phone_does_not_blacklist_whatsapp_channel(self):
         client = OAuthClient(config={}, verbose=False)
@@ -197,6 +198,54 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         self.assertIsNone(state)
         phone_service.mark_blacklisted.assert_not_called()
         self.assertIn("whatsapp", client.last_error)
+        self.assertEqual(client.last_error_code, "add_phone_verification_failed")
+
+    def test_handle_add_phone_sets_error_code_when_capability_missing(self):
+        client = OAuthClient(config={}, verbose=False)
+        client._log = lambda _msg: None
+
+        with mock.patch("platforms.chatgpt.oauth_client.SMSToMePhoneService") as mocked_service:
+            mocked_service.return_value.enabled = False
+            state = client._handle_add_phone_verification(
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+                FlowState(page_type="add_phone"),
+            )
+
+        self.assertIsNone(state)
+        self.assertEqual(client.last_error_code, "add_phone_capability_missing")
+
+    def test_handle_add_phone_sets_error_code_when_configured_code_missing(self):
+        client = OAuthClient(
+            config={"chatgpt_phone_number": "+447000000003"},
+            verbose=False,
+        )
+        client._log = lambda _msg: None
+
+        with mock.patch.object(
+            client,
+            "_send_phone_number",
+            return_value=(
+                True,
+                FlowState(
+                    page_type="phone_otp_verification",
+                    continue_url="https://auth.openai.com/phone-verification",
+                ),
+                "",
+            ),
+        ):
+            state = client._handle_add_phone_verification(
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+                FlowState(page_type="add_phone"),
+            )
+
+        self.assertIsNone(state)
+        self.assertEqual(client.last_error_code, "add_phone_config_code_missing")
 
 
 if __name__ == "__main__":

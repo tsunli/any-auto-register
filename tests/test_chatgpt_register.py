@@ -226,6 +226,29 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
     def _make_client(self):
         return OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False)
 
+    def test_oauth_get_cookie_value_supports_chunked_session_cookie(self):
+        client = OAuthClient.__new__(OAuthClient)
+        client.session = types.SimpleNamespace(
+            cookies=[
+                types.SimpleNamespace(
+                    name="__Secure-next-auth.session-token.1",
+                    domain=".chatgpt.com",
+                    value="part-b",
+                ),
+                types.SimpleNamespace(
+                    name="__Secure-next-auth.session-token.0",
+                    domain=".chatgpt.com",
+                    value="part-a",
+                ),
+            ]
+        )
+
+        value = client._get_cookie_value(
+            "__Secure-next-auth.session-token",
+            "chatgpt.com",
+        )
+        self.assertEqual(value, "part-apart-b")
+
     def test_submit_signup_register_uses_minimal_headers_strategy(self):
         client = self._make_client()
         client.session.post = mock.Mock(
@@ -419,6 +442,21 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertNotIn("json", kwargs)
         self.assertNotIn("data", kwargs)
 
+    def test_send_passwordless_login_otp_sets_error_code_on_http_failure(self):
+        client = self._make_client()
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = "blocked"
+        client.session.post = mock.Mock(return_value=response)
+
+        state = client._send_passwordless_login_otp(
+            "user@example.com",
+            "device-fixed",
+        )
+
+        self.assertIsNone(state)
+        self.assertEqual(client.last_error_code, "oauth_passwordless_send_failed")
+
     def test_login_and_get_tokens_submits_about_you_when_configured(self):
         client = self._make_client()
         about_you_state = FlowState(
@@ -456,8 +494,147 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertEqual(submit_about_you.call_args.args[1], "Stone")
         self.assertEqual(submit_about_you.call_args.args[2], "1990-01-02")
 
+    def test_submit_about_you_sets_error_code_when_profile_incomplete(self):
+        client = self._make_client()
+
+        state = client._submit_about_you_create_account(
+            "",
+            "",
+            "",
+            "device-fixed",
+            user_agent="UA",
+            sec_ch_ua='"Chromium";v="136"',
+            impersonate="chrome136",
+        )
+
+        self.assertIsNone(state)
+        self.assertEqual(client.last_error_code, "about_you_profile_incomplete")
+
+    def test_submit_about_you_sets_error_code_on_http_failure(self):
+        client = self._make_client()
+        response = mock.Mock()
+        response.status_code = 500
+        response.text = "server error"
+        response.url = "https://auth.openai.com/api/accounts/create_account"
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.build_sentinel_token",
+            return_value="",
+        ):
+            state = client._submit_about_you_create_account(
+                "Ivy",
+                "Stone",
+                "1990-01-02",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                referer="https://auth.openai.com/about-you",
+            )
+
+        self.assertIsNone(state)
+        self.assertEqual(client.last_error_code, "about_you_submit_failed")
+
+    def test_workspace_submit_sets_error_code_when_session_data_missing(self):
+        client = self._make_client()
+
+        with mock.patch.object(
+            client,
+            "_load_workspace_session_data",
+            return_value=None,
+        ):
+            code, state = client._oauth_submit_workspace_and_org(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "device-fixed",
+                "UA",
+                "chrome136",
+                max_retries=1,
+            )
+
+        self.assertIsNone(code)
+        self.assertIsNone(state)
+        self.assertEqual(client.last_error_code, "consent_session_missing")
+
+    def test_workspace_submit_sets_error_code_when_workspace_missing(self):
+        client = self._make_client()
+
+        with mock.patch.object(
+            client,
+            "_load_workspace_session_data",
+            return_value={"workspaces": []},
+        ):
+            code, state = client._oauth_submit_workspace_and_org(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "device-fixed",
+                "UA",
+                "chrome136",
+                max_retries=1,
+            )
+
+        self.assertIsNone(code)
+        self.assertIsNone(state)
+        self.assertEqual(client.last_error_code, "workspace_missing")
+
+    def test_login_and_get_tokens_sets_error_code_when_email_otp_client_missing(self):
+        client = self._make_client()
+        email_otp_state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+
+        with mock.patch.object(client, "_bootstrap_oauth_session", return_value="https://auth.openai.com/log-in"), \
+            mock.patch.object(client, "_submit_authorize_continue", return_value=email_otp_state):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                skymail_client=None,
+                prefer_passwordless_login=True,
+                allow_phone_verification=False,
+            )
+
+        self.assertIsNone(tokens)
+        self.assertEqual(client.last_error_code, "oauth_otp_client_missing")
+
 
 class BrowserFallbackTests(unittest.TestCase):
+    def _make_reuse_client(self, state: FlowState):
+        client = ChatGPTClient.__new__(ChatGPTClient)
+        client.session = mock.Mock()
+        client.session.cookies = types.SimpleNamespace(jar=[])
+        client.last_registration_state = state
+        client.last_stage = ""
+        client.last_token_exchange_error_code = ""
+        client.last_token_exchange_error = ""
+        client._log = lambda _msg: None
+        client._browser_pause = lambda *_args, **_kwargs: None
+        client._headers = lambda *_args, **_kwargs: {}
+        return client
+
+    def test_chatgpt_get_cookie_value_supports_chunked_session_cookie(self):
+        client = ChatGPTClient.__new__(ChatGPTClient)
+        client.session = types.SimpleNamespace(
+            cookies=types.SimpleNamespace(
+                jar=[
+                    types.SimpleNamespace(
+                        name="__Secure-next-auth.session-token.1",
+                        domain=".chatgpt.com",
+                        value="part-b",
+                    ),
+                    types.SimpleNamespace(
+                        name="__Secure-next-auth.session-token.0",
+                        domain=".chatgpt.com",
+                        value="part-a",
+                    ),
+                ]
+            )
+        )
+
+        value = client.get_next_auth_session_token()
+        self.assertEqual(value, "part-apart-b")
+
     def test_chatgpt_create_account_uses_browser_fallback_on_challenge(self):
         client = ChatGPTClient(proxy="http://127.0.0.1:7890", verbose=False, browser_mode="headless")
         client._get_sentinel_token = mock.Mock(return_value="sentinel-token")
@@ -565,6 +742,62 @@ class BrowserFallbackTests(unittest.TestCase):
         self.assertEqual(code, "auth-code")
         self.assertEqual(state.page_type, "oauth_callback")
         client._browser_capture_callback.assert_called_once()
+
+    def test_reuse_session_and_get_tokens_marks_callback_not_landed(self):
+        client = self._make_reuse_client(
+            FlowState(
+                page_type="external_url",
+                continue_url="https://chatgpt.com/",
+                current_url="https://auth.openai.com/about-you",
+            )
+        )
+
+        with mock.patch.object(client, "_follow_flow_state", return_value=(False, "callback missing")):
+            ok, detail = client.reuse_session_and_get_tokens()
+
+        self.assertFalse(ok)
+        self.assertIn("注册回调落地失败", detail)
+        self.assertEqual(client.last_token_exchange_error_code, "callback_not_landed")
+
+    def test_reuse_session_and_get_tokens_marks_session_cookie_missing(self):
+        client = self._make_reuse_client(
+            FlowState(
+                page_type="chatgpt_home",
+                current_url="https://chatgpt.com/",
+            )
+        )
+        client.session.get = mock.Mock(return_value=mock.Mock(status_code=200, url="https://chatgpt.com/"))
+
+        with mock.patch.object(client, "get_next_auth_session_token", side_effect=["", "", "", "", ""]):
+            with mock.patch("time.sleep", return_value=None):
+                ok, detail = client.reuse_session_and_get_tokens()
+
+        self.assertFalse(ok)
+        self.assertIn("缺少 ChatGPT session-token", detail)
+        self.assertEqual(client.last_token_exchange_error_code, "session_cookie_missing")
+
+    def test_reuse_session_and_get_tokens_marks_auth_session_missing_access_token(self):
+        client = self._make_reuse_client(
+            FlowState(
+                page_type="chatgpt_home",
+                current_url="https://chatgpt.com/",
+            )
+        )
+
+        with mock.patch.object(client, "get_next_auth_session_token", return_value="sess-token"):
+            with mock.patch.object(
+                client,
+                "fetch_chatgpt_session",
+                return_value=(False, "/api/auth/session 未返回 accessToken"),
+            ):
+                ok, detail = client.reuse_session_and_get_tokens()
+
+        self.assertFalse(ok)
+        self.assertEqual(detail, "/api/auth/session 未返回 accessToken")
+        self.assertEqual(
+            client.last_token_exchange_error_code,
+            "auth_session_missing_access_token",
+        )
 
 
 if __name__ == "__main__":
