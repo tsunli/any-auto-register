@@ -37,6 +37,12 @@ CONFIG_KEYS = [
     "mail_provider",
     "outlook_backend",
     "mailbox_otp_timeout_seconds",
+    "default_executor_type",
+    "consecutive_fail_threshold",
+    "chatgpt_oauth_session_max_requests",
+    "chatgpt_oauth_session_max_age_seconds",
+    "chatgpt_ip_cooldown_enabled",
+    "chatgpt_ip_cooldown_seconds",
     "maliapi_base_url",
     "maliapi_api_key",
     "maliapi_domain",
@@ -145,6 +151,18 @@ def get_config():
         all_cfg["forward_gmail_port"] = "993"
     if not all_cfg.get("forwardmail_pool_dir"):
         all_cfg["forwardmail_pool_dir"] = "mail"
+    if not all_cfg.get("default_executor_type"):
+        all_cfg["default_executor_type"] = all_cfg.get("default_executor", "") or "protocol"
+    if not str(all_cfg.get("consecutive_fail_threshold", "") or "").strip():
+        all_cfg["consecutive_fail_threshold"] = "15"
+    if not str(all_cfg.get("chatgpt_oauth_session_max_requests", "") or "").strip():
+        all_cfg["chatgpt_oauth_session_max_requests"] = "80"
+    if not str(all_cfg.get("chatgpt_oauth_session_max_age_seconds", "") or "").strip():
+        all_cfg["chatgpt_oauth_session_max_age_seconds"] = "240"
+    if not str(all_cfg.get("chatgpt_ip_cooldown_enabled", "") or "").strip():
+        all_cfg["chatgpt_ip_cooldown_enabled"] = "1"
+    if not str(all_cfg.get("chatgpt_ip_cooldown_seconds", "") or "").strip():
+        all_cfg["chatgpt_ip_cooldown_seconds"] = "600"
     if not str(all_cfg.get("contribution_enabled", "") or "").strip():
         all_cfg["contribution_enabled"] = "0"
     if not all_cfg.get("contribution_server_url"):

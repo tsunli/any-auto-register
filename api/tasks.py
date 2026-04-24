@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 from typing import Optional
 from copy import deepcopy
-from core.db import TaskLog, engine
+from core.db import TaskLog, engine, write_task_log
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -32,6 +32,7 @@ class RegisterTaskRequest(BaseModel):
     count: int = 1
     concurrency: int = 1
     register_delay_seconds: float = 0
+    consecutive_fail_threshold: Optional[int] = None
     proxy: Optional[str] = None
     executor_type: str = "protocol"
     captcha_solver: str = "yescaptcha"
@@ -59,6 +60,12 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
 
     req_data = req.model_dump()
     req_data["extra"] = deepcopy(req_data.get("extra") or {})
+    if req_data.get("consecutive_fail_threshold", None) in (None, ""):
+        raw_threshold = config_store.get("consecutive_fail_threshold", "15")
+        try:
+            req_data["consecutive_fail_threshold"] = max(0, int(raw_threshold or 15))
+        except Exception:
+            req_data["consecutive_fail_threshold"] = 15
     prepared = RegisterTaskRequest(**req_data)
 
     mail_provider = prepared.extra.get("mail_provider") or config_store.get(
@@ -128,19 +135,39 @@ def _log(task_id: str, msg: str):
 
 
 def _save_task_log(
-    platform: str, email: str, status: str, error: str = "", detail: dict = None
+    platform: str,
+    email: str,
+    status: str,
+    error: str = "",
+    detail: dict = None,
+    *,
+    task_id: str = "",
+    run_id: str = "",
+    source: str = "",
 ):
     """Write a TaskLog record to the database."""
-    with Session(engine) as s:
-        log = TaskLog(
-            platform=platform,
-            email=email,
-            status=status,
-            error=error,
-            detail_json=json.dumps(detail or {}, ensure_ascii=False),
-        )
-        s.add(log)
-        s.commit()
+    write_task_log(
+        platform,
+        email,
+        status,
+        error=error,
+        detail=detail,
+        task_id=task_id,
+        run_id=run_id,
+        source=source,
+    )
+
+
+def _is_whitelisted_skip_message(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    whitelist_markers = (
+        "add_phone 黑名单",
+        "add-phone blacklist",
+        "在 add_phone 黑名单中",
+    )
+    return any(marker.lower() in text for marker in whitelist_markers)
 
 
 def _auto_upload_integrations(task_id: str, account):
@@ -165,6 +192,8 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     from core.proxy_utils import normalize_proxy_url
 
     control = _task_store.control_for(task_id)
+    task_snapshot = _task_store.snapshot(task_id)
+    task_source = str(task_snapshot.get("source") or "manual").strip() or "manual"
     _task_store.mark_running(task_id)
     success = 0
     skipped = 0
@@ -203,9 +232,13 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         def _do_one(i: int):
             nonlocal next_start_time
             proxy_pool = None
+            _platform = None
             _proxy = None
             current_email = req.email or ""
             attempt_id: int | None = None
+            started_at = time.time()
+            registration_mode = ""
+            effective_executor = req.executor_type or "protocol"
             try:
                 from core.proxy_pool import proxy_pool
 
@@ -239,8 +272,18 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                     {k: v for k, v in req.extra.items() if v is not None and v != ""}
                 )
 
+                effective_executor = (req.executor_type or "").strip() or "protocol"
+                default_executor = (merged_extra.get("default_executor_type") or "").strip().lower()
+                if default_executor in {"protocol", "headless", "headed"} and (
+                    not req.executor_type or effective_executor == "protocol"
+                ):
+                    if default_executor != effective_executor:
+                        _log(task_id, f"依据 config 覆盖 executor_type: {effective_executor} -> {default_executor}")
+                    effective_executor = default_executor
+                registration_mode = str(merged_extra.get("chatgpt_registration_mode") or "").strip()
+
                 _config = RegisterConfig(
-                    executor_type=req.executor_type,
+                    executor_type=effective_executor,
                     captcha_solver=req.captcha_solver,
                     proxy=_proxy,
                     extra=merged_extra,
@@ -293,7 +336,50 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if _proxy:
                     proxy_pool.report_success(_proxy)
                 _log(task_id, f"[OK] 注册成功: {account.email}")
-                _save_task_log(req.platform, account.email, "success")
+                _save_task_log(
+                    req.platform,
+                    account.email,
+                    "success",
+                    detail={
+                        "stage": "success",
+                        "task_id": task_id,
+                        "run_id": task_id,
+                        "source": task_source,
+                        "proxy": _proxy or "",
+                        "executor_type": effective_executor,
+                        "registration_mode": (account.extra or {}).get(
+                            "chatgpt_registration_mode", ""
+                        )
+                        or registration_mode,
+                        "elapsed_ms": int((time.time() - started_at) * 1000),
+                        "has_access_token": bool((account.token or "").strip()),
+                        "has_refresh_token": bool(
+                            (account.extra or {}).get("refresh_token", "")
+                        ),
+                        "has_session_token": bool((account.extra or {}).get("session_token", "")),
+                        "last_stage": (account.extra or {}).get("last_stage", ""),
+                        "stages_trace": (account.extra or {}).get(
+                            "stages_trace", []
+                        ),
+                        "registration_flow": (account.extra or {}).get(
+                            "registration_flow", ""
+                        ),
+                        "token_flow": (account.extra or {}).get(
+                            "token_flow", ""
+                        ),
+                        "error_code": (account.extra or {}).get("error_code", ""),
+                        "token_source": (account.extra or {}).get(
+                            "chatgpt_token_source", ""
+                        ),
+                    },
+                    task_id=task_id,
+                    run_id=task_id,
+                    source=task_source,
+                )
+                if req.platform == "chatgpt" and (account.extra or {}).get(
+                    "workspace_id", ""
+                ):
+                    _log(task_id, f"workspace进度: {i + 1}/{req.count}")
                 _auto_upload_integrations(task_id, saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
@@ -302,11 +388,31 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 return AttemptResult.success()
             except SkipCurrentAttemptRequested as e:
                 _log(task_id, f"[SKIP] 已跳过当前账号: {e}")
+                platform_error_metadata = {}
+                if _platform is not None:
+                    raw_metadata = getattr(_platform, "last_error_metadata", None)
+                    if isinstance(raw_metadata, dict):
+                        platform_error_metadata = dict(raw_metadata)
                 _save_task_log(
                     req.platform,
                     current_email,
                     "skipped",
                     error=str(e),
+                    detail={
+                        "stage": "skipped",
+                        "task_id": task_id,
+                        "run_id": task_id,
+                        "source": task_source,
+                        "proxy": _proxy or "",
+                        "executor_type": effective_executor,
+                        "registration_mode": registration_mode,
+                        "elapsed_ms": int((time.time() - started_at) * 1000),
+                        "reason": type(e).__name__,
+                        **platform_error_metadata,
+                    },
+                    task_id=task_id,
+                    run_id=task_id,
+                    source=task_source,
                 )
                 return AttemptResult.skipped(str(e))
             except StopTaskRequested as e:
@@ -316,11 +422,38 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 if _proxy and proxy_pool is not None:
                     proxy_pool.report_fail(_proxy)
                 _log(task_id, f"[FAIL] 注册失败: {e}")
+                err_text = str(e)
+                http_status = ""
+                platform_error_metadata = {}
+                if _platform is not None:
+                    raw_metadata = getattr(_platform, "last_error_metadata", None)
+                    if isinstance(raw_metadata, dict):
+                        platform_error_metadata = dict(raw_metadata)
+                import re as _re
+                m = _re.search(r"\b(4\d\d|5\d\d)\b", err_text)
+                if m:
+                    http_status = m.group(1)
                 _save_task_log(
                     req.platform,
                     current_email,
                     "failed",
-                    error=str(e),
+                    error=err_text,
+                    detail={
+                        "stage": "failed",
+                        "task_id": task_id,
+                        "run_id": task_id,
+                        "source": task_source,
+                        "proxy": _proxy or "",
+                        "executor_type": effective_executor,
+                        "registration_mode": registration_mode,
+                        "http_status": http_status,
+                        "elapsed_ms": int((time.time() - started_at) * 1000),
+                        "exception": type(e).__name__,
+                        **platform_error_metadata,
+                    },
+                    task_id=task_id,
+                    run_id=task_id,
+                    source=task_source,
                 )
                 return AttemptResult.failed(str(e))
             finally:
@@ -330,6 +463,10 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
 
         max_workers = min(req.concurrency, req.count, 5)
         stopped = False
+        consecutive_fail_count = 0
+        consecutive_fail_threshold = max(
+            0, int(getattr(req, "consecutive_fail_threshold", 0) or 0)
+        )
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_do_one, i) for i in range(req.count)]
             for f in as_completed(futures):
@@ -340,20 +477,39 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 except Exception as e:
                     _log(task_id, f"[ERROR] 任务线程异常: {e}")
                     errors.append(str(e))
+                    consecutive_fail_count += 1
                     continue
                 if result.outcome == AttemptOutcome.SUCCESS:
                     success += 1
+                    consecutive_fail_count = 0
                 elif result.outcome == AttemptOutcome.SKIPPED:
                     skipped += 1
+                    if _is_whitelisted_skip_message(result.message):
+                        consecutive_fail_count = 0
+                    else:
+                        consecutive_fail_count += 1
                 elif result.outcome == AttemptOutcome.STOPPED:
                     stopped = True
                 else:
                     errors.append(result.message)
+                    consecutive_fail_count += 1
                 _task_store.update_counters(
                     task_id,
                     success=success,
                     registered=success + skipped + len(errors),
                 )
+                if (
+                    not stopped
+                    and consecutive_fail_threshold > 0
+                    and consecutive_fail_count >= consecutive_fail_threshold
+                ):
+                    _log(
+                        task_id,
+                        "[ABORT] consecutive fail threshold reached: "
+                        f"{consecutive_fail_count}/{consecutive_fail_threshold}",
+                    )
+                    control.request_stop()
+                    stopped = True
                 if stopped or control.is_stop_requested():
                     stopped = True
                     for pending in futures:
