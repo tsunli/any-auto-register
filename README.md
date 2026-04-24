@@ -19,6 +19,7 @@
 - [技术栈](#技术栈)
 - [环境要求](#环境要求)
 - [ChatGPT 专项能力](#chatgpt-专项能力)
+- [ChatGPT 脚本说明](#chatgpt-脚本说明)
 - [邮箱服务支持](#邮箱服务支持)
 - [快速开始](#快速开始)
 - [Docker 部署](#docker-部署)
@@ -119,6 +120,99 @@
 - **补传远端未发现**
   - 补传远端未发现的 auth-file
   - 支持“当前筛选范围”或“当前所选账号”两种作用范围
+
+## ChatGPT 脚本说明
+
+当前仓库里，和 ChatGPT 注册/补救直接相关的常用脚本主要有两条：
+
+- `scripts/register_chatgpt_accounts.py`
+  - 常规批量注册脚本
+  - 默认注册模式：`refresh_token`
+- `scripts/rescue_stuck_accounts.py`
+  - 针对 forwardmail 池中“卡住 / 未入库”邮箱的补救脚本
+  - 默认注册模式：`access_token_only`
+
+### 1. CLIProxyAPI 自动同步
+
+这两条脚本现在都会在 **账号注册成功并写入 `accounts` 表之后**，默认自动尝试同步到 **CLIProxyAPI**。
+
+同步行为要点：
+
+- **默认开启**
+- **同步失败不会把注册本身判成失败**
+- 会把同步结果写进对应的 `task_logs.detail_json`
+- 控制台会打印一条 `cliproxyapi` 摘要日志
+
+脚本内部复用了与前端“补传远端未发现”相同的后端逻辑，因此语义保持一致：
+
+- 如果远端已存在，会直接跳过上传
+- 如果本地状态不可上传，会返回失败原因
+- 如果上传成功，会继续复核远端状态
+
+### 2. register_chatgpt_accounts.py 示例
+
+常规运行：
+
+```bash
+python scripts/register_chatgpt_accounts.py --count 5 --delay 60
+```
+
+关闭自动同步：
+
+```bash
+python scripts/register_chatgpt_accounts.py --count 5 --no-cliproxyapi-sync
+```
+
+覆盖 CLIProxyAPI 地址与管理口令：
+
+```bash
+python scripts/register_chatgpt_accounts.py \
+  --count 5 \
+  --cliproxyapi-api-url http://127.0.0.1:8317 \
+  --cliproxyapi-api-key cliproxyapi
+```
+
+### 3. rescue_stuck_accounts.py 示例
+
+常规运行：
+
+```bash
+python scripts/rescue_stuck_accounts.py --limit 10 --delay 60
+```
+
+关闭自动同步：
+
+```bash
+python scripts/rescue_stuck_accounts.py --limit 10 --no-cliproxyapi-sync
+```
+
+覆盖 CLIProxyAPI 地址与管理口令：
+
+```bash
+python scripts/rescue_stuck_accounts.py \
+  --limit 10 \
+  --cliproxyapi-api-url http://127.0.0.1:8317 \
+  --cliproxyapi-api-key cliproxyapi
+```
+
+### 4. CLIProxyAPI 配置来源
+
+如果命令行没有显式传：
+
+- `--cliproxyapi-api-url`
+- `--cliproxyapi-api-key`
+
+脚本会优先从当前配置中读取：
+
+- `cliproxyapi_base_url`
+- `cliproxyapi_management_key`
+
+同时，现有后端补传逻辑也兼容历史兜底配置：
+
+- `cpa_api_url`
+- `cpa_api_key`
+
+因此如果你已经在设置页或数据库配置里填好了 CLIProxyAPI 参数，通常可以直接运行脚本，无需每次手动传参。
 
 ## 邮箱服务支持
 
