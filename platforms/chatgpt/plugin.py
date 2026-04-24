@@ -6,6 +6,7 @@ import string
 from core.base_mailbox import BaseMailbox
 from core.base_platform import Account, BasePlatform, RegisterConfig
 from core.registry import register
+from core.task_runtime import TaskInterruption
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
@@ -39,6 +40,14 @@ class ChatGPTPlatform(BasePlatform):
             return False
 
     def register(self, email: str = None, password: str = None) -> Account:
+        self.last_error_metadata = {}
+        if email:
+            from core.task_runtime import SkipCurrentAttemptRequested
+            from platforms.chatgpt.oauth_client import is_email_add_phone_blacklisted
+            if is_email_add_phone_blacklisted(email):
+                raise SkipCurrentAttemptRequested(
+                    f"邮箱 {email} 在 add_phone 黑名单中，跳过注册"
+                )
         if not password:
             password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=16))
 
@@ -47,6 +56,10 @@ class ChatGPTPlatform(BasePlatform):
         extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
         log_fn = getattr(self, "_log_fn", print)
         max_retries = 3
+        reuse_generated_email = bool(
+            extra_config.get("chatgpt_reuse_generated_email")
+            or extra_config.get("chatgpt_reuse_existing_generated_email")
+        )
         try:
             max_retries = int(extra_config.get("register_max_retries", 3) or 3)
         except Exception:
@@ -89,7 +102,21 @@ class ChatGPTPlatform(BasePlatform):
                     self._before_ids = set()
 
                 def create_email(self, config=None):
-                    if self._email and self._acct and _fixed_email:
+                    if self._email and self._acct and (_fixed_email or reuse_generated_email):
+                        return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
+                    if _fixed_email and not self._acct:
+                        from core.base_mailbox import MailboxAccount as _MA
+                        self._acct = _MA(
+                            email=_fixed_email,
+                            account_id=_fixed_email,
+                            extra={"provider": "reused_fixed_email"},
+                        )
+                        get_current_ids = getattr(_mailbox, "get_current_ids", None)
+                        if callable(get_current_ids):
+                            self._before_ids = set(get_current_ids(self._acct) or [])
+                        else:
+                            self._before_ids = set()
+                        self._email = _fixed_email
                         return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
                     self._acct = _mailbox.get_email()
                     get_current_ids = getattr(_mailbox, "get_current_ids", None)
@@ -100,7 +127,7 @@ class ChatGPTPlatform(BasePlatform):
                     generated_email = getattr(self._acct, "email", "")
                     if not self._email:
                         self._email = _resolve_email(generated_email)
-                    elif not _fixed_email:
+                    elif not _fixed_email and not reuse_generated_email:
                         self._email = _resolve_email(generated_email)
                     return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
 
@@ -146,6 +173,12 @@ class ChatGPTPlatform(BasePlatform):
                     self._before_ids = set()
 
                 def create_email(self, config=None):
+                    if self._acct is not None and reuse_generated_email:
+                        return {
+                            "email": str(getattr(self._acct, "email", "") or "").strip(),
+                            "service_id": self._acct.account_id,
+                            "token": self._acct.account_id,
+                        }
                     acct = _tmail.get_email()
                     self._acct = acct
                     self._before_ids = set(_tmail.get_current_ids(acct) or [])
@@ -192,8 +225,17 @@ class ChatGPTPlatform(BasePlatform):
             max_retries=max_retries,
             extra_config=extra_config,
         )
-        result = adapter.run(context)
+        try:
+            result = adapter.run(context)
+        except TaskInterruption:
+            self.last_error_metadata = dict(
+                getattr(adapter, "last_error_metadata", {}) or {}
+            )
+            raise
         if not result or not result.success:
+            metadata = getattr(result, "metadata", None)
+            if isinstance(metadata, dict):
+                self.last_error_metadata = dict(metadata)
             raise RuntimeError(result.error_message if result else "注册失败")
 
         return adapter.build_account(result, password)

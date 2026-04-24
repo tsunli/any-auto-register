@@ -164,9 +164,9 @@ class RefreshTokenRegistrationEngine:
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
         self.browser_mode = str(browser_mode or "protocol").strip().lower() or "protocol"
-        # 已移除整流程重试能力，保留参数仅兼容调用方
-        self.max_retries = 1
+        self.max_retries = max(1, int(max_retries or 1))
         self.extra_config = dict(extra_config or {})
+        self.last_error_metadata = {}
 
         self.email: Optional[str] = None
         self.password: Optional[str] = None
@@ -322,6 +322,37 @@ class RefreshTokenRegistrationEngine:
             or ""
         ).strip()
 
+    @staticmethod
+    def _merge_stage_trace(*traces) -> list[str]:
+        merged: list[str] = []
+        for trace in traces:
+            for item in list(trace or []):
+                text = str(item or "").strip()
+                if text:
+                    merged.append(text)
+        return merged
+
+    def _build_stage_metadata(
+        self,
+        register_client: Any,
+        oauth_client: Any,
+        *,
+        error_code: str = "",
+    ) -> dict[str, Any]:
+        register_trace = list(getattr(register_client, "stage_trace", []) or [])
+        oauth_trace = list(getattr(oauth_client, "stage_trace", []) or [])
+        return {
+            "last_stage": str(
+                getattr(oauth_client, "last_stage", "")
+                or getattr(register_client, "last_stage", "")
+                or ""
+            ).strip(),
+            "stages_trace": self._merge_stage_trace(register_trace, oauth_trace),
+            "register_stages_trace": register_trace,
+            "oauth_stages_trace": oauth_trace,
+            "error_code": str(error_code or "").strip(),
+        }
+
     def _populate_result_from_tokens(
         self,
         result: RegistrationResult,
@@ -350,6 +381,7 @@ class RefreshTokenRegistrationEngine:
         result.session_token = session_token
         result.source = source
         result.metadata = {
+            **self._build_stage_metadata(register_client, oauth_client),
             "email_service": self.email_service.service_type.value,
             "proxy_used": self.proxy_url,
             "registered_at": datetime.now().isoformat(),
@@ -365,6 +397,18 @@ class RefreshTokenRegistrationEngine:
             "account_claims_email": account_info.get("email", ""),
         }
 
+    @staticmethod
+    def _is_retriable_error(message: str) -> bool:
+        text = str(message or "").lower()
+        markers = (
+            "tls", "ssl", "curl: (35)", "预授权被拦截",
+            "authorize", "registration_disallowed", "http 400",
+            "创建邮箱失败", "访问首页失败", "csrf",
+            "consent", "workspace", "organization",
+            "session", "broken pipe", "connection reset",
+        )
+        return any(m in text for m in markers)
+
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
         last_error = ""
@@ -372,7 +416,7 @@ class RefreshTokenRegistrationEngine:
         register_otp_wait_seconds = self._read_int_config(
             "chatgpt_register_otp_wait_seconds",
             fallback_keys=("chatgpt_otp_wait_seconds",),
-            default=600,
+            default=300,
             minimum=30,
             maximum=3600,
         )
@@ -384,9 +428,42 @@ class RefreshTokenRegistrationEngine:
             maximum=3600,
         )
 
+        for attempt in range(self.max_retries):
+            if attempt > 0:
+                self._log(f"RT 整流程重试 {attempt + 1}/{self.max_retries} ...")
+                self.email = fixed_email or None
+                time.sleep(min(2 ** attempt, 10))
+
+            try:
+                return self._run_single_attempt(
+                    result, fixed_email,
+                    register_otp_wait_seconds, register_otp_resend_wait_seconds,
+                )
+            except TaskInterruption:
+                raise
+            except Exception as e:
+                last_error = str(e)
+                self._log(f"RT 注册第 {attempt + 1} 轮异常: {last_error}", "error")
+                if attempt < self.max_retries - 1 and self._is_retriable_error(last_error):
+                    continue
+                result.error_message = last_error
+                return result
+
+        result.error_message = last_error or "注册失败"
+        return result
+
+    def _run_single_attempt(
+        self,
+        result: RegistrationResult,
+        fixed_email: str,
+        register_otp_wait_seconds: int,
+        register_otp_resend_wait_seconds: int,
+    ) -> RegistrationResult:
         try:
             registration_message = ""
             source = "register"
+            register_client = None
+            oauth_client = None
 
             self._log("=" * 60)
             self._log("ChatGPT RT 全新主链路启动")
@@ -445,6 +522,11 @@ class RefreshTokenRegistrationEngine:
                     registration_message
                 ):
                     last_error = f"注册状态机失败: {registration_message}"
+                    result.metadata = {
+                        **self._build_stage_metadata(register_client, None),
+                        "registration_flow": "chatgpt_client.register_complete_flow",
+                        "token_flow": "oauth_client.login_and_get_tokens",
+                    }
                     result.error_message = last_error
                     return result
 
@@ -530,6 +612,19 @@ class RefreshTokenRegistrationEngine:
 
             if not tokens:
                 last_error = oauth_client.last_error or "OAuth 登录状态机失败"
+                result.metadata = {
+                    **self._build_stage_metadata(
+                        register_client,
+                        oauth_client,
+                        error_code=str(
+                            getattr(oauth_client, "last_error_code", "")
+                            or getattr(register_client, "last_token_exchange_error_code", "")
+                            or ""
+                        ).strip(),
+                    ),
+                    "registration_flow": "chatgpt_client.register_complete_flow",
+                    "token_flow": "oauth_client.login_and_get_tokens",
+                }
                 result.error_message = last_error
                 return result
 
@@ -549,11 +644,19 @@ class RefreshTokenRegistrationEngine:
             return result
 
         except TaskInterruption:
+            self.last_error_metadata = self._build_stage_metadata(
+                register_client,
+                oauth_client,
+                error_code=str(
+                    getattr(oauth_client, "last_error_code", "")
+                    or getattr(register_client, "last_token_exchange_error_code", "")
+                    or ""
+                ).strip(),
+            )
             raise
         except Exception as e:
             self._log(f"RT 注册主链路异常: {e}", "error")
-            result.error_message = str(e)
-            return result
+            raise
 
     def save_to_database(self, result: RegistrationResult) -> bool:
         """保留旧接口，占位返回。"""

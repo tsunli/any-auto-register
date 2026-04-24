@@ -9,7 +9,61 @@ import json
 import random
 from urllib.parse import urlparse, parse_qs
 from core.proxy_utils import build_requests_proxy_config
-from core.task_runtime import TaskInterruption
+from pathlib import Path as _Path
+from core.task_runtime import SkipCurrentAttemptRequested, TaskInterruption
+
+_ADD_PHONE_BLACKLIST_FILE = (
+    _Path(__file__).resolve().parents[2] / "mail" / "add_phone_blacklist.json"
+)
+
+
+def _append_add_phone_blacklist(email: str, reason: str = "") -> None:
+    """把命中 add_phone 风控的邮箱写入持久化黑名单。"""
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    try:
+        _ADD_PHONE_BLACKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        existing = {}
+        if _ADD_PHONE_BLACKLIST_FILE.exists():
+            try:
+                existing = json.loads(_ADD_PHONE_BLACKLIST_FILE.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except Exception:
+                existing = {}
+        if email in existing:
+            return
+        existing[email] = {
+            "blocked_at": int(time.time()),
+            "reason": reason or "add_phone",
+        }
+        _ADD_PHONE_BLACKLIST_FILE.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+_ADD_PHONE_BLACKLIST_TTL_SECONDS = 7 * 86400  # 7 天过期
+
+
+def is_email_add_phone_blacklisted(email: str) -> bool:
+    email = (email or "").strip().lower()
+    if not email or not _ADD_PHONE_BLACKLIST_FILE.exists():
+        return False
+    try:
+        data = json.loads(_ADD_PHONE_BLACKLIST_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or email not in data:
+            return False
+        entry = data[email]
+        blocked_at = int(entry.get("blocked_at", 0)) if isinstance(entry, dict) else 0
+        if blocked_at and (int(time.time()) - blocked_at) > _ADD_PHONE_BLACKLIST_TTL_SECONDS:
+            return False
+        return True
+    except Exception:
+        return False
 
 try:
     from curl_cffi import requests as curl_requests
@@ -57,18 +111,86 @@ class OAuthClient:
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
         self.last_error = ""
+        self.last_error_code = ""
+        self.last_error_metadata = {}
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self.last_stage = ""
+        self.stage_trace = []
         self.device_id = ""
         self.ua = ""
         self.sec_ch_ua = ""
         self.impersonate = ""
+        self._session_req_count = 0
+        self._session_born_at = time.time()
+        self._session_max_req = self._read_int_config(
+            (
+                "chatgpt_oauth_session_max_requests",
+                "chatgpt_session_max_requests",
+                "oauth_session_max_requests",
+            ),
+            default=80,
+            minimum=10,
+            maximum=1000,
+        )
+        self._session_max_age = self._read_int_config(
+            (
+                "chatgpt_oauth_session_max_age_seconds",
+                "chatgpt_session_max_age_seconds",
+                "oauth_session_max_age_seconds",
+            ),
+            default=240,
+            minimum=30,
+            maximum=3600,
+        )
+        self._ip_cooldown_enabled = self._read_bool_config(
+            ("ip_cooldown_enabled", "chatgpt_ip_cooldown_enabled"),
+            default=True,
+        )
+        self._ip_cooldown_seconds = self._read_int_config(
+            ("ip_cooldown_seconds", "chatgpt_ip_cooldown_seconds"),
+            default=600,
+            minimum=60,
+            maximum=3600,
+        )
 
         # 创建 session
         self.session = curl_requests.Session()
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
+
+    def _read_int_config(
+        self,
+        keys: tuple[str, ...],
+        *,
+        default: int,
+        minimum: int,
+        maximum: int,
+    ) -> int:
+        for key in keys:
+            if key not in self.config:
+                continue
+            value = self.config.get(key)
+            try:
+                parsed = int(value)
+            except Exception:
+                continue
+            return max(minimum, min(parsed, maximum))
+        return max(minimum, min(int(default), maximum))
+
+    def _read_bool_config(self, keys: tuple[str, ...], *, default: bool) -> bool:
+        for key in keys:
+            if key not in self.config:
+                continue
+            value = self.config.get(key)
+            if isinstance(value, bool):
+                return value
+            text = str(value or "").strip().lower()
+            if text in {"1", "true", "yes", "on"}:
+                return True
+            if text in {"0", "false", "no", "off"}:
+                return False
+        return default
 
     def adopt_browser_context(
         self,
@@ -119,19 +241,32 @@ class OAuthClient:
             print(f"  [OAuth] {msg}")
 
     def _enter_stage(self, stage: str, detail: str = ""):
+        if not hasattr(self, "stage_trace") or self.stage_trace is None:
+            self.stage_trace = []
         self.last_stage = str(stage or "").strip()
         if self.last_stage:
+            self.stage_trace.append(self.last_stage)
             message = f"[stage={self.last_stage}]"
             if detail:
                 message += f" {detail}"
             self._log(message)
 
-    def _set_error(self, message):
+    def _set_error(self, message, *, error_code: str | None = None, extra: dict | None = None):
         raw_message = str(message or "").strip()
         if self.last_stage and raw_message and f"[stage={self.last_stage}]" not in raw_message:
             self.last_error = f"[stage={self.last_stage}] {raw_message}"
         else:
             self.last_error = raw_message
+        if error_code is not None:
+            self.last_error_code = str(error_code or "").strip()
+        metadata = {
+            "last_stage": self.last_stage,
+            "stages_trace": list(self.stage_trace or []),
+            "error_code": self.last_error_code,
+        }
+        if extra:
+            metadata.update(extra)
+        self.last_error_metadata = metadata
         if self.last_error:
             self._log(self.last_error)
 
@@ -143,13 +278,6 @@ class OAuthClient:
     @staticmethod
     def _random_chrome_fingerprint():
         profiles = [
-            {
-                "major": 131,
-                "impersonate": "chrome131",
-                "build": 6778,
-                "patch_range": (69, 205),
-                "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-            },
             {
                 "major": 133,
                 "impersonate": "chrome133a",
@@ -165,22 +293,32 @@ class OAuthClient:
                 "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
             },
         ]
+        platforms = [
+            {
+                "ua_tpl": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+                "platform": '"Windows"',
+                "arch": '"x86"',
+            },
+            {
+                "ua_tpl": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+                "platform": '"macOS"',
+                "arch": '"arm"',
+            },
+        ]
         profile = random.choice(profiles)
+        plat = random.choice(platforms)
         major = profile["major"]
         build = profile["build"]
         patch = random.randint(*profile["patch_range"])
         full_ver = f"{major}.0.{build}.{patch}"
-        ua = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
-        )
-        return ua, profile["sec_ch_ua"], profile["impersonate"]
+        ua = plat["ua_tpl"].format(ver=full_ver)
+        return ua, profile["sec_ch_ua"], profile["impersonate"], plat
 
     def _ensure_oauth_fingerprint(self, user_agent, sec_ch_ua, impersonate):
         if user_agent and sec_ch_ua and impersonate:
             return user_agent, sec_ch_ua, impersonate
 
-        ua, ch_ua, imp = self._random_chrome_fingerprint()
+        ua, ch_ua, imp, plat = self._random_chrome_fingerprint()
         user_agent = user_agent or ua
         sec_ch_ua = sec_ch_ua or ch_ua
         impersonate = impersonate or imp
@@ -202,8 +340,8 @@ class OAuthClient:
                     ),
                     "sec-ch-ua": sec_ch_ua,
                     "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                    "sec-ch-ua-arch": '"x86"',
+                    "sec-ch-ua-platform": plat["platform"],
+                    "sec-ch-ua-arch": plat["arch"],
                     "sec-ch-ua-bitness": '"64"',
                 }
             )
@@ -369,16 +507,34 @@ class OAuthClient:
         )
 
     def _get_cookie_value(self, name, domain_hint=None):
-        """读取当前会话中的 Cookie。"""
+        """读取当前会话中的 Cookie（兼容 next-auth 分片 cookie）。"""
         try:
+            exact_value = ""
+            chunk_prefix = f"{name}."
+            chunk_parts = {}
             for cookie in self.session.cookies:
                 cookie_name = cookie.name if hasattr(cookie, "name") else str(cookie)
-                if cookie_name != name:
-                    continue
                 cookie_domain = cookie.domain if hasattr(cookie, "domain") else ""
                 if domain_hint and domain_hint not in (cookie_domain or ""):
                     continue
-                return cookie.value if hasattr(cookie, "value") else ""
+                cookie_value = cookie.value if hasattr(cookie, "value") else ""
+                if cookie_name == name:
+                    exact_value = cookie_value
+                    if exact_value:
+                        return exact_value
+                    continue
+                if not cookie_name.startswith(chunk_prefix):
+                    continue
+                chunk_idx = cookie_name[len(chunk_prefix):]
+                if not chunk_idx.isdigit():
+                    continue
+                idx = int(chunk_idx)
+                if idx not in chunk_parts:
+                    chunk_parts[idx] = cookie_value
+            if exact_value:
+                return exact_value
+            if chunk_parts:
+                return "".join(value for _, value in sorted(chunk_parts.items()))
         except Exception:
             pass
         return ""
@@ -498,7 +654,7 @@ class OAuthClient:
                     kwargs["impersonate"] = impersonate
 
                 self._browser_pause(0.12, 0.3)
-                r = self.session.get(current_url, **kwargs)
+                r = self._http("GET", current_url, **kwargs)
                 last_url = str(r.url)
                 self._log(f"follow[{hop + 1}] {r.status_code} {last_url[:120]}")
             except Exception as e:
@@ -579,7 +735,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r = self.session.get(authorize_url, **kwargs)
+            r = self._http("GET", authorize_url, **kwargs)
             authorize_final_url = str(r.url)
             redirects = len(getattr(r, "history", []) or [])
             self._log(f"/oauth/authorize -> {r.status_code}, redirects={redirects}")
@@ -616,7 +772,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r2 = self.session.get(oauth2_url, **kwargs)
+            r2 = self._http("GET", oauth2_url, **kwargs)
             authorize_final_url = str(r2.url)
             redirects2 = len(getattr(r2, "history", []) or [])
             self._log(
@@ -653,7 +809,7 @@ class OAuthClient:
         try:
             self._log("force_chatgpt_entry: 访问 ChatGPT 首页...")
             self._browser_pause()
-            r_home = self.session.get(
+            r_home = self._http("GET", 
                 homepage_url,
                 headers=self._headers(
                     homepage_url,
@@ -672,7 +828,7 @@ class OAuthClient:
         csrf_token = ""
         try:
             self._log("force_chatgpt_entry: 获取 CSRF token...")
-            r_csrf = self.session.get(
+            r_csrf = self._http("GET", 
                 csrf_url,
                 headers=self._headers(
                     csrf_url,
@@ -706,7 +862,7 @@ class OAuthClient:
                 "csrfToken": csrf_token,
                 "json": "true",
             }
-            r_signin = self.session.post(
+            r_signin = self._http("POST", 
                 signin_url,
                 params=params,
                 data=form_data,
@@ -753,7 +909,7 @@ class OAuthClient:
             }
             if impersonate:
                 kwargs["impersonate"] = impersonate
-            r_auth = self.session.get(authorize_url, **kwargs)
+            r_auth = self._http("GET", authorize_url, **kwargs)
             final_url = str(r_auth.url)
             self._log(
                 f"force_chatgpt_entry: authorize 最终跳转 {final_url[:160]}"
@@ -837,7 +993,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r = self.session.post(request_url, **kwargs)
+            r = self._http("POST", request_url, **kwargs)
             self._log(f"/authorize/continue -> {r.status_code}")
             self._log(
                 "authorize_continue 响应: "
@@ -877,7 +1033,7 @@ class OAuthClient:
                 if impersonate:
                     kwargs["impersonate"] = impersonate
                 self._browser_pause()
-                r = self.session.post(request_url, **kwargs)
+                r = self._http("POST", request_url, **kwargs)
                 self._log(f"/authorize/continue(重试) -> {r.status_code}")
 
             if r.status_code != 200:
@@ -961,7 +1117,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r = self.session.post(request_url, **kwargs)
+            r = self._http("POST", request_url, **kwargs)
             self._log(f"/password/verify -> {r.status_code}")
 
             if r.status_code != 200:
@@ -1017,11 +1173,14 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r = self.session.post(request_url, **kwargs)
+            r = self._http("POST", request_url, **kwargs)
             self._log(f"/passwordless/send-otp -> {r.status_code}")
 
             if r.status_code != 200:
-                self._set_error(f"触发 passwordless OTP 失败: {r.status_code} - {r.text[:180]}")
+                self._set_error(
+                    f"触发 passwordless OTP 失败: {r.status_code} - {r.text[:180]}",
+                    error_code="oauth_passwordless_send_failed",
+                )
                 return None
 
             try:
@@ -1037,8 +1196,19 @@ class OAuthClient:
                 flow_state = self._state_from_url(f"{self.oauth_issuer}/email-verification")
             self._log(f"passwordless OTP 已触发 {describe_flow_state(flow_state)}")
             return flow_state
+        except TaskInterruption:
+            raise
         except Exception as e:
-            self._set_error(f"触发 passwordless OTP 异常: {e}")
+            if self._is_connection_broken(e):
+                self._log(f"检测到连接中断({type(e).__name__}): {e}，重建 session 并跳过本邮箱")
+                self._recreate_session()
+                raise SkipCurrentAttemptRequested(
+                    f"连接中断触发 session 重建: {type(e).__name__}"
+                )
+            self._set_error(
+                f"触发 passwordless OTP 异常: {e}",
+                error_code="oauth_passwordless_send_failed",
+            )
             return None
 
     def _submit_signup_register(
@@ -1112,7 +1282,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r = self.session.post(request_url, **kwargs)
+            r = self._http("POST", request_url, **kwargs)
             self._log(f"/user/register -> {r.status_code}")
 
             if r.status_code != 200:
@@ -1163,7 +1333,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r = self.session.get(request_url, **kwargs)
+            r = self._http("GET", request_url, **kwargs)
             self._log(f"/email-otp/send -> {r.status_code}")
             if r.status_code != 200:
                 self._set_error(f"发送注册 OTP 失败: {r.status_code} - {r.text[:180]}")
@@ -1187,7 +1357,7 @@ class OAuthClient:
                 verify_kwargs["impersonate"] = impersonate
 
             self._browser_pause(0.12, 0.25)
-            r_verify = self.session.get(verify_url, **verify_kwargs)
+            r_verify = self._http("GET", verify_url, **verify_kwargs)
             self._log(f"/email-verification -> {r_verify.status_code}")
 
             content_type = (r_verify.headers.get("content-type", "") or "").lower()
@@ -1228,6 +1398,8 @@ class OAuthClient:
     ):
         """完成 OAuth 单链注册并换取 refresh token。"""
         self.last_error = ""
+        self.last_error_code = ""
+        self.last_error_metadata = {}
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self._log(
@@ -1239,7 +1411,10 @@ class OAuthClient:
         )
 
         if not skymail_client:
-            self._set_error("OAuth 注册流程缺少接码客户端")
+            self._set_error(
+                "OAuth 注册流程缺少接码客户端",
+                error_code="oauth_signup_otp_client_missing",
+            )
             return None
 
         device_id = str(device_id or "").strip() or str(uuid.uuid4())
@@ -1514,7 +1689,10 @@ class OAuthClient:
 
         full_name = f"{str(first_name or '').strip()} {str(last_name or '').strip()}".strip()
         if not full_name or not str(birthdate or "").strip():
-            self._set_error("about_you 资料不完整: 缺少姓名或生日")
+            self._set_error(
+                "about_you 资料不完整: 缺少姓名或生日",
+                error_code="about_you_profile_incomplete",
+            )
             return None
 
         about_you_url = f"{self.oauth_issuer}/about-you"
@@ -1555,7 +1733,7 @@ class OAuthClient:
             if impersonate:
                 kwargs["impersonate"] = impersonate
             self._browser_pause()
-            return self.session.post(request_url, **kwargs)
+            return self._http("POST", request_url, **kwargs)
 
         try:
             r = _post_create()
@@ -1580,7 +1758,10 @@ class OAuthClient:
                     impersonate=impersonate,
                 )
                 if not sentinel_token:
-                    self._set_error("无法获取 sentinel token (oauth_create_account)")
+                    self._set_error(
+                        "无法获取 sentinel token (oauth_create_account)",
+                        error_code="about_you_sentinel_missing",
+                    )
                     return None
 
                 r = _post_create(sentinel_token)
@@ -1598,7 +1779,10 @@ class OAuthClient:
                 return consent_state
 
             if r.status_code != 200:
-                self._set_error(f"about_you 提交失败: {r.status_code} - {r.text[:180]}")
+                self._set_error(
+                    f"about_you 提交失败: {r.status_code} - {r.text[:180]}",
+                    error_code="about_you_submit_failed",
+                )
                 return None
 
             try:
@@ -1626,14 +1810,133 @@ class OAuthClient:
             self._log(f"about_you 提交成功 {describe_flow_state(flow_state)}")
             return flow_state
         except Exception as e:
-            self._set_error(f"about_you 提交异常: {e}")
+            self._set_error(
+                f"about_you 提交异常: {e}",
+                error_code="about_you_submit_failed",
+            )
             return None
 
     def _recreate_session(self):
-        """重新创建会话容器。"""
-        self.session = curl_requests.Session()
+        """重新创建会话容器，并尽可能保留已有 cookie/headers。"""
+        old_session = getattr(self, "session", None)
+        old_headers = {}
+        old_cookies = None
+        if old_session is not None:
+            try:
+                old_headers = dict(getattr(old_session, "headers", {}) or {})
+            except Exception:
+                old_headers = {}
+            try:
+                old_cookies = getattr(old_session, "cookies", None)
+            except Exception:
+                old_cookies = None
+
+        new_session = curl_requests.Session()
         if self.proxy:
-            self.session.proxies = build_requests_proxy_config(self.proxy)
+            new_session.proxies = build_requests_proxy_config(self.proxy)
+        if old_headers:
+            try:
+                new_session.headers.update(old_headers)
+            except Exception:
+                pass
+        if old_cookies is not None:
+            try:
+                new_session.cookies.update(old_cookies)
+            except Exception:
+                pass
+
+        try:
+            if old_session is not None:
+                old_session.close()
+        except Exception:
+            pass
+        self.session = new_session
+        self._session_req_count = 0
+        self._session_born_at = time.time()
+
+    def _maybe_rotate_session(self):
+        expired_by_req = self._session_req_count >= self._session_max_req
+        expired_by_age = (time.time() - self._session_born_at) >= self._session_max_age
+        if expired_by_req or expired_by_age:
+            self._log(
+                "session 到期回收: "
+                f"reqs={self._session_req_count}, age={int(time.time() - self._session_born_at)}s"
+            )
+            self._recreate_session()
+
+    def _should_cool_down_proxy(self, response) -> bool:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code in (409, 429):
+            return True
+        if status_code != 403:
+            return False
+        try:
+            text = str(getattr(response, "text", "") or "").lower()
+        except Exception:
+            text = ""
+        cf_markers = (
+            "cloudflare",
+            "just a moment",
+            "cf-ray",
+            "attention required",
+            "__cf_chl",
+            "challenge-platform",
+        )
+        return any(marker in text for marker in cf_markers)
+
+    def _cool_down_current_proxy(self, status_code: int, url: str):
+        if not self._ip_cooldown_enabled or not self.proxy:
+            return
+        try:
+            from core.proxy_pool import proxy_pool as _proxy_pool
+
+            _proxy_pool.cool_down(self.proxy, self._ip_cooldown_seconds)
+            self._log(
+                f"IP 限流 {status_code}，代理冷却 {self._ip_cooldown_seconds}s: {self.proxy}"
+            )
+        except Exception as e:
+            self._log(f"代理冷却失败(忽略): {e}")
+
+    def _http(self, method: str, url: str, *, _retry: bool = False, **kwargs):
+        self._maybe_rotate_session()
+        self._session_req_count += 1
+        try:
+            response = self.session.request(method, url, **kwargs)
+        except TaskInterruption:
+            raise
+        except Exception as e:
+            if self._is_connection_broken(e):
+                if not _retry:
+                    self._log(
+                        f"连接中断({type(e).__name__})，重建 session 后单次重试: {url}"
+                    )
+                    self._recreate_session()
+                    return self._http(method, url, _retry=True, **kwargs)
+                raise SkipCurrentAttemptRequested(
+                    f"session 重建后仍失败: {type(e).__name__}"
+                )
+            raise
+
+        if self._should_cool_down_proxy(response):
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            self._cool_down_current_proxy(status_code, url)
+            raise SkipCurrentAttemptRequested(f"IP 限流 {status_code}，冷却代理")
+        return response
+
+    @staticmethod
+    def _is_connection_broken(exc: BaseException) -> bool:
+        """识别底层连接已损坏、需要重建 session 的异常。"""
+        if exc is None:
+            return False
+        name = type(exc).__name__
+        msg = str(exc).lower()
+        if name in {"BrokenPipeError", "ConnectionResetError", "ConnectionAbortedError"}:
+            return True
+        if "requestserror" in name.lower() or "curlerror" in name.lower():
+            return True
+        tokens = ("broken pipe", "connection reset", "connection aborted",
+                  "connection closed", "epipe", "ssl: bad")
+        return any(t in msg for t in tokens)
 
     def login_and_get_tokens(
         self,
@@ -1684,6 +1987,8 @@ class OAuthClient:
             dict: tokens 字典，包含 access_token, refresh_token, id_token
         """
         self.last_error = ""
+        self.last_error_code = ""
+        self.last_error_metadata = {}
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self._log(
@@ -1913,7 +2218,10 @@ class OAuthClient:
 
             if self._state_is_email_otp(state):
                 if not skymail_client:
-                    self._set_error("当前流程需要邮箱 OTP，但缺少接码客户端")
+                    self._set_error(
+                        "当前流程需要邮箱 OTP，但缺少接码客户端",
+                        error_code="oauth_otp_client_missing",
+                    )
                     return None
                 next_state = self._handle_otp_verification(
                     email,
@@ -2034,11 +2342,31 @@ class OAuthClient:
                             _continue_depth=_continue_depth + 1,
                         )
                     else:
-                        self._set_error(
-                            "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
+                        reason = (
+                            "passwordless 登录后仍停留在 add_phone"
                             + (f" ({workspace_error})" if workspace_error else "")
                         )
-                        return None
+                        self._set_error(
+                            reason,
+                            error_code="add_phone_workspace_or_callback_missing",
+                        )
+                        defer_add_phone_blacklist = self._read_bool_config(
+                            (
+                                "chatgpt_defer_add_phone_blacklist_for_at_fallback",
+                                "chatgpt_add_phone_at_fallback_enabled",
+                            ),
+                            default=False,
+                        )
+                        if defer_add_phone_blacklist:
+                            self._log(
+                                f"邮箱 {email} 命中 add_phone 风控，暂不立即加入黑名单；交由 access_token_only 兜底"
+                            )
+                            return None
+                        _append_add_phone_blacklist(email, reason=reason)
+                        self._log(
+                            f"邮箱 {email} 已加入 add_phone 黑名单，跳过本轮以避免 OpenAI 风控加重"
+                        )
+                        raise SkipCurrentAttemptRequested(f"add_phone 风控: {reason}")
                 else:
                     next_state = self._handle_add_phone_verification(
                         device_id,
@@ -2147,80 +2475,269 @@ class OAuthClient:
         )
         return code, (next_state.current_url or next_state.continue_url or start_url)
 
+    def _acquire_sentinel_token(
+        self,
+        flow: str,
+        page_url: str,
+        device_id: str,
+        user_agent: str | None = None,
+        sec_ch_ua: str | None = None,
+        impersonate: str | None = None,
+    ) -> str:
+        """统一的 sentinel token 获取：优先 Playwright，失败回退 HTTP PoW。"""
+        token = get_sentinel_token_via_browser(
+            flow=flow,
+            proxy=self.proxy,
+            page_url=page_url or self.oauth_issuer,
+            headless=self.browser_mode != "headed",
+            device_id=device_id,
+            log_fn=lambda msg: self._log(f"{flow}: {msg}"),
+        )
+        if token:
+            self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
+            return token
+        token = build_sentinel_token(
+            self.session,
+            device_id,
+            flow=flow,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+        if token:
+            self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
+        return token or ""
+
+    def _post_workspace_select(
+        self,
+        workspace_id: str,
+        consent_url: str,
+        device_id: str,
+        user_agent,
+        sec_ch_ua,
+        impersonate,
+        *,
+        attempts: int = 3,
+    ):
+        """POST /workspace/select，带 sentinel + 接口级退避重试。
+
+        返回 tuple(status_code, response_or_none)。上层基于该结果判定是否继续。
+        """
+        url = f"{self.oauth_issuer}/api/accounts/workspace/select"
+        last_exc = None
+        for attempt in range(max(1, int(attempts))):
+            sentinel = self._acquire_sentinel_token(
+                "workspace_select",
+                consent_url or self.oauth_issuer,
+                device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+            headers = self._headers(
+                url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=consent_url,
+                origin=self.oauth_issuer,
+                content_type="application/json",
+                fetch_site="same-origin",
+                extra_headers={
+                    "oai-device-id": device_id,
+                    **({"openai-sentinel-token": sentinel} if sentinel else {}),
+                },
+            )
+            headers.update(generate_datadog_trace())
+
+            try:
+                kwargs = {
+                    "json": {"workspace_id": workspace_id},
+                    "headers": headers,
+                    "allow_redirects": False,
+                    "timeout": 30,
+                }
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+
+                self._browser_pause()
+                r = self._http("POST", url, **kwargs)
+                self._log(
+                    f"workspace/select -> {r.status_code} "
+                    f"(attempt {attempt + 1}/{attempts}, sentinel={'on' if sentinel else 'off'})"
+                )
+                if r.status_code < 500 and r.status_code != 429:
+                    return r.status_code, r
+            except Exception as exc:
+                last_exc = exc
+                self._log(f"workspace/select 异常 (attempt {attempt + 1}): {exc}")
+
+            if attempt < attempts - 1:
+                backoff = min(8.0, 1.0 * (2 ** attempt))
+                time.sleep(backoff)
+
+        if last_exc is not None:
+            self._set_error(
+                f"workspace/select 异常: {last_exc}",
+                error_code="workspace_select_request_failed",
+            )
+        return None, None
+
+    def _post_organization_select(
+        self,
+        org_id: str,
+        project_id: str | None,
+        referer: str,
+        device_id: str,
+        user_agent,
+        sec_ch_ua,
+        impersonate,
+        *,
+        attempts: int = 3,
+    ):
+        """POST /organization/select，带 sentinel + 接口级退避重试。"""
+        url = f"{self.oauth_issuer}/api/accounts/organization/select"
+        body: dict[str, str] = {"org_id": org_id}
+        if project_id:
+            body["project_id"] = project_id
+
+        last_exc = None
+        for attempt in range(max(1, int(attempts))):
+            sentinel = self._acquire_sentinel_token(
+                "organization_select",
+                referer or self.oauth_issuer,
+                device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+            headers = self._headers(
+                url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=referer,
+                origin=self.oauth_issuer,
+                content_type="application/json",
+                fetch_site="same-origin",
+                extra_headers={
+                    "oai-device-id": device_id,
+                    **({"openai-sentinel-token": sentinel} if sentinel else {}),
+                },
+            )
+            headers.update(generate_datadog_trace())
+
+            try:
+                kwargs = {
+                    "json": body,
+                    "headers": headers,
+                    "allow_redirects": False,
+                    "timeout": 30,
+                }
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+
+                self._browser_pause()
+                r = self._http("POST", url, **kwargs)
+                self._log(
+                    f"organization/select -> {r.status_code} "
+                    f"(attempt {attempt + 1}/{attempts}, sentinel={'on' if sentinel else 'off'})"
+                )
+                if r.status_code < 500 and r.status_code != 429:
+                    return r.status_code, r
+            except Exception as exc:
+                last_exc = exc
+                self._log(f"organization/select 异常 (attempt {attempt + 1}): {exc}")
+
+            if attempt < attempts - 1:
+                backoff = min(8.0, 1.0 * (2 ** attempt))
+                time.sleep(backoff)
+
+        if last_exc is not None:
+            self._set_error(
+                f"organization/select 异常: {last_exc}",
+                error_code="organization_select_request_failed",
+            )
+        return None, None
+
     def _oauth_submit_workspace_and_org(
         self, consent_url, device_id, user_agent, impersonate, max_retries=3
     ):
-        """提交 workspace 和 organization 选择（带重试）"""
-        self._enter_stage("workspace_select", consent_url[:120] if consent_url else "")
-        session_data = None
+        """提交 workspace 和 organization 选择。
 
+        核心鲁棒性改进（见失败模式分析）：
+          1. POST /workspace/select 与 /organization/select 均带 openai-sentinel-token
+             （与 authorize_continue / email_otp_validate 对齐，避免服务端返回降级 HTML）
+          2. session_data 获取采用指数退避（0.5s → 2s → 6s），给新账号后端同步时间
+          3. 多候选循环：依次尝试全部 workspaces × 全部 orgs，不再固定取 [0]
+          4. 接口层重试：非 200 / 429 / 5xx / 网络异常自动退避重试
+        """
+        self._enter_stage("workspace_select", consent_url[:120] if consent_url else "")
+        sec_ch_ua = getattr(self, "sec_ch_ua", None)
+
+        # ─── 阶段 1：获取 consent session_data（指数退避 0.5/2/6s）
+        session_data = None
         for attempt in range(max_retries):
             session_data = self._load_workspace_session_data(
                 consent_url=consent_url,
                 user_agent=user_agent,
                 impersonate=impersonate,
             )
-            if session_data:
+            if session_data and session_data.get("workspaces"):
                 break
-
             if attempt < max_retries - 1:
+                backoff = min(8.0, 0.5 * (3 ** attempt))
                 self._log(
-                    f"无法获取 consent session 数据 (尝试 {attempt + 1}/{max_retries})"
+                    f"无法获取 consent session 数据，{backoff:.1f}s 后重试 "
+                    f"({attempt + 1}/{max_retries})"
                 )
-                time.sleep(0.3)
-            else:
-                self._set_error("无法获取 consent session 数据")
-                return None, None
+                time.sleep(backoff)
 
-        workspaces = session_data.get("workspaces", [])
+        if not session_data or not session_data.get("workspaces"):
+            self._set_error(
+                "无法获取 consent session 数据",
+                error_code="consent_session_missing",
+            )
+            return None, None
+
+        workspaces = [ws for ws in (session_data.get("workspaces") or []) if (ws or {}).get("id")]
         if not workspaces:
-            self._set_error("session 中没有 workspace 信息")
+            self._set_error("session 中没有 workspace 信息", error_code="workspace_missing")
             return None, None
 
-        workspace_id = (workspaces[0] or {}).get("id")
-        if not workspace_id:
-            self._set_error("workspace_id 为空")
-            return None, None
-
-        self.last_workspace_id = str(workspace_id).strip()
-        self._log(f"选择 workspace: {workspace_id}")
-
-        headers = self._headers(
-            f"{self.oauth_issuer}/api/accounts/workspace/select",
-            user_agent=user_agent,
-            accept="application/json",
-            referer=consent_url,
-            origin=self.oauth_issuer,
-            content_type="application/json",
-            fetch_site="same-origin",
-            extra_headers={
-                "oai-device-id": device_id,
-            },
-        )
-        headers.update(generate_datadog_trace())
-
-        try:
-            kwargs = {
-                "json": {"workspace_id": workspace_id},
-                "headers": headers,
-                "allow_redirects": False,
-                "timeout": 30,
-            }
-            if impersonate:
-                kwargs["impersonate"] = impersonate
-
-            self._browser_pause()
-            r = self.session.post(
-                f"{self.oauth_issuer}/api/accounts/workspace/select", **kwargs
-            )
-
-            self._log(f"workspace/select -> {r.status_code}")
+        last_state = None
+        # ─── 阶段 2 / 3：多候选循环
+        for ws_idx, workspace in enumerate(workspaces):
+            workspace_id = str((workspace or {}).get("id") or "").strip()
+            if not workspace_id:
+                continue
+            self.last_workspace_id = workspace_id
             self._log(
-                f"workspace/select 请求: workspace_id={workspace_id} consent_url={consent_url[:120]}"
+                f"选择 workspace [{ws_idx + 1}/{len(workspaces)}]: {workspace_id}"
+            )
+            self._log(
+                f"workspace/select 请求: workspace_id={workspace_id} "
+                f"consent_url={(consent_url or '')[:120]}"
             )
 
-            # 检查重定向
-            if r.status_code in (301, 302, 303, 307, 308):
+            status_code, r = self._post_workspace_select(
+                workspace_id,
+                consent_url,
+                device_id,
+                user_agent,
+                sec_ch_ua,
+                impersonate,
+            )
+            if r is None:
+                continue  # 接口级重试仍失败，尝试下一个 workspace
+            if status_code != 200 and status_code not in (301, 302, 303, 307, 308):
+                self._log(
+                    f"workspace/select 非成功状态 {status_code}，跳过该 workspace 继续尝试"
+                )
+                continue
+
+            # 2a. 重定向直出 code（罕见但要处理）
+            if status_code in (301, 302, 303, 307, 308):
                 location = normalize_flow_url(
                     r.headers.get("Location", ""), auth_base=self.oauth_issuer
                 )
@@ -2230,122 +2747,144 @@ class OAuthClient:
                         self._log("从 workspace/select 重定向获取到 code")
                         return code, self._state_from_url(location)
                 if location:
-                    return None, self._state_from_url(location)
+                    last_state = self._state_from_url(location)
+                continue
 
-            # 如果返回 200，检查响应中的 orgs
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    orgs = data.get("data", {}).get("orgs", [])
-                    workspace_state = self._state_from_payload(
-                        data, current_url=str(r.url)
+            # 2b. 200 → 解析 orgs，多候选循环
+            try:
+                data = r.json()
+            except Exception as exc:
+                self._set_error(
+                    f"解析 workspace/select 响应异常: {exc}",
+                    error_code="workspace_select_response_invalid",
+                )
+                continue
+
+            workspace_state = self._state_from_payload(data, current_url=str(r.url))
+            continue_url = workspace_state.continue_url
+            orgs = [o for o in (data.get("data", {}).get("orgs") or []) if (o or {}).get("id")]
+
+            # Fallback：/workspace/select 响应 orgs 为空时，退回到 consent HTML 解析到的 orgs
+            if not orgs:
+                session_orgs = [
+                    o for o in (session_data.get("orgs") or []) if (o or {}).get("id")
+                ]
+                if session_orgs:
+                    self._log(
+                        f"/workspace/select 响应 orgs 为空，fallback 到 consent HTML 解析的 "
+                        f"{len(session_orgs)} 个 org 候选"
                     )
-                    continue_url = workspace_state.continue_url
+                    orgs = session_orgs
 
-                    if orgs:
-                        org_id = (orgs[0] or {}).get("id")
-                        projects = (orgs[0] or {}).get("projects", [])
-                        project_id = (projects[0] or {}).get("id") if projects else None
+            if not orgs and continue_url:
+                # 无 orgs 直接跟随 continue_url 看能否拿到 code
+                code, _ = self._oauth_follow_for_code(
+                    continue_url, consent_url, user_agent, impersonate
+                )
+                if code:
+                    return code, self._state_from_url(continue_url)
 
-                        if org_id:
-                            self._log(f"选择 organization: {org_id}")
+            for org_idx, org in enumerate(orgs):
+                org_id = str((org or {}).get("id") or "").strip()
+                if not org_id:
+                    continue
+                projects = (org or {}).get("projects") or []
+                project_id = str((projects[0] or {}).get("id") or "").strip() if projects else ""
+                self._log(
+                    f"选择 organization [{org_idx + 1}/{len(orgs)}]: {org_id} "
+                    f"project={project_id or '-'}"
+                )
+                org_referer = (
+                    continue_url
+                    if continue_url and continue_url.startswith("http")
+                    else consent_url
+                )
+                self._log(
+                    f"organization/select 请求: org_id={org_id} project_id={project_id or '-'}"
+                )
+                org_status, r_org = self._post_organization_select(
+                    org_id,
+                    project_id or None,
+                    org_referer,
+                    device_id,
+                    user_agent,
+                    sec_ch_ua,
+                    impersonate,
+                )
+                if r_org is None:
+                    continue
 
-                            org_body = {"org_id": org_id}
-                            if project_id:
-                                org_body["project_id"] = project_id
-
-                            org_referer = (
-                                continue_url
-                                if continue_url and continue_url.startswith("http")
-                                else consent_url
-                            )
-                            headers = self._headers(
-                                f"{self.oauth_issuer}/api/accounts/organization/select",
-                                user_agent=user_agent,
-                                accept="application/json",
-                                referer=org_referer,
-                                origin=self.oauth_issuer,
-                                content_type="application/json",
-                                fetch_site="same-origin",
-                                extra_headers={
-                                    "oai-device-id": device_id,
-                                },
-                            )
-                            headers.update(generate_datadog_trace())
-
-                            kwargs = {
-                                "json": org_body,
-                                "headers": headers,
-                                "allow_redirects": False,
-                                "timeout": 30,
-                            }
-                            if impersonate:
-                                kwargs["impersonate"] = impersonate
-
-                            self._browser_pause()
-                            r_org = self.session.post(
-                                f"{self.oauth_issuer}/api/accounts/organization/select",
-                                **kwargs,
-                            )
-
-                            self._log(f"organization/select -> {r_org.status_code}")
-                            self._log(
-                                f"organization/select 请求: org_id={org_id} project_id={project_id or '-'}"
-                            )
-
-                            # 检查重定向
-                            if r_org.status_code in (301, 302, 303, 307, 308):
-                                location = normalize_flow_url(
-                                    r_org.headers.get("Location", ""),
-                                    auth_base=self.oauth_issuer,
-                                )
-                                if "code=" in location:
-                                    code = self._extract_code_from_url(location)
-                                    if code:
-                                        self._log(
-                                            "从 organization/select 重定向获取到 code"
-                                        )
-                                        return code, self._state_from_url(location)
-                                if location:
-                                    return None, self._state_from_url(location)
-
-                            # 检查 continue_url
-                            if r_org.status_code == 200:
-                                try:
-                                    org_state = self._state_from_payload(
-                                        r_org.json(), current_url=str(r_org.url)
-                                    )
-                                    self._log(
-                                        f"organization/select -> {describe_flow_state(org_state)}"
-                                    )
-                                    if self._extract_code_from_state(org_state):
-                                        return self._extract_code_from_state(
-                                            org_state
-                                        ), org_state
-                                    return None, org_state
-                                except Exception as e:
-                                    self._set_error(
-                                        f"解析 organization/select 响应异常: {e}"
-                                    )
-
-                    # 如果有 continue_url，跟随它
-                    if continue_url:
+                # 3a. 重定向拿 code
+                if org_status in (301, 302, 303, 307, 308):
+                    location = normalize_flow_url(
+                        r_org.headers.get("Location", ""),
+                        auth_base=self.oauth_issuer,
+                    )
+                    if "code=" in location:
+                        code = self._extract_code_from_url(location)
+                        if code:
+                            self._log("从 organization/select 重定向获取到 code")
+                            return code, self._state_from_url(location)
+                    if location:
+                        follow_state = self._state_from_url(location)
+                        # 跟随 location 再拿 code
                         code, _ = self._oauth_follow_for_code(
-                            continue_url, consent_url, user_agent, impersonate
+                            location, org_referer, user_agent, impersonate
                         )
                         if code:
-                            return code, self._state_from_url(continue_url)
-                    return None, workspace_state
+                            return code, follow_state
+                        last_state = follow_state
+                        continue
 
-                except Exception as e:
-                    self._set_error(f"处理 workspace/select 响应异常: {e}")
-                    return None, None
+                # 3b. 200 → state 含 code？
+                if org_status == 200:
+                    try:
+                        org_state = self._state_from_payload(
+                            r_org.json(), current_url=str(r_org.url)
+                        )
+                        self._log(
+                            f"organization/select -> {describe_flow_state(org_state)}"
+                        )
+                        code = self._extract_code_from_state(org_state)
+                        if code:
+                            return code, org_state
 
-        except Exception as e:
-            self._set_error(f"workspace/select 异常: {e}")
-            return None, None
+                        # 跟随 continue_url 取 code
+                        next_url = org_state.continue_url or continue_url
+                        if next_url:
+                            code, _ = self._oauth_follow_for_code(
+                                next_url, org_referer, user_agent, impersonate
+                            )
+                            if code:
+                                return code, org_state
+                        last_state = org_state
+                    except Exception as exc:
+                        self._set_error(
+                            f"解析 organization/select 响应异常: {exc}",
+                            error_code="organization_select_response_invalid",
+                        )
+                    continue
 
-        return None, None
+                # 非预期状态
+                self._log(
+                    f"organization/select 非预期状态 {org_status}，尝试下一个 org 候选"
+                )
+
+            # 本 workspace 的 orgs 全部试过都没拿到 code，尝试最终 continue_url
+            if continue_url:
+                code, _ = self._oauth_follow_for_code(
+                    continue_url, consent_url, user_agent, impersonate
+                )
+                if code:
+                    return code, self._state_from_url(continue_url)
+
+            last_state = workspace_state
+
+        self._set_error(
+            "workspace/organization 候选全部尝试后仍未拿到 code",
+            error_code="workspace_select_exhausted",
+        )
+        return None, last_state
 
     def _load_workspace_session_data(self, consent_url, user_agent, impersonate):
         """优先从 cookie 解码 session，失败时回退到 consent HTML 中提取 workspace 数据。"""
@@ -2380,7 +2919,7 @@ class OAuthClient:
             if impersonate:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.3)
-            r = self.session.get(consent_url, **kwargs)
+            r = self._http("GET", consent_url, **kwargs)
             if r.status_code == 200 and "text/html" in (
                 r.headers.get("content-type", "").lower()
             ):
@@ -2390,7 +2929,17 @@ class OAuthClient:
         return ""
 
     def _extract_session_data_from_consent_html(self, html):
-        """从 consent HTML 的 React Router stream 中提取 workspace session 数据。"""
+        """从 consent HTML 的 React Router stream 中提取 workspace + orgs session 数据。
+
+        返回结构:
+          {
+            "session_id": str,
+            "openai_client_id": str,
+            "workspaces": [{"id": "<uuid>", "kind": ...}, ...],
+            "orgs": [{"id": "org-...", "projects": [{"id": "proj_..."}]}, ...]
+          }
+        其中 orgs 是 /workspace/select 响应 orgs 为空时的 fallback 数据源。
+        """
         import json
         import re
 
@@ -2403,6 +2952,38 @@ class OAuthClient:
                 if m:
                     return m.group(1)
             return ""
+
+        def _extract_orgs(normalized: str) -> list[dict]:
+            """从 normalized 文本里解出 orgs 列表（id=org-xxx，projects=proj_xxx）。"""
+            org_ids = re.findall(r'"(org-[A-Za-z0-9]+)"', normalized)
+            if not org_ids:
+                return []
+            # 保序去重
+            unique_orgs: list[str] = []
+            seen_org: set[str] = set()
+            for oid in org_ids:
+                if oid in seen_org:
+                    continue
+                seen_org.add(oid)
+                unique_orgs.append(oid)
+
+            # 为每个 org 贪心地抓紧邻其后的第一个 proj_xxx（typical stream 顺序）
+            orgs: list[dict] = []
+            cursor = 0
+            for oid in unique_orgs:
+                pos = normalized.find(oid, cursor)
+                if pos < 0:
+                    orgs.append({"id": oid, "projects": []})
+                    continue
+                # 在 org 之后 1200 字符内找第一个 proj_xxx
+                window = normalized[pos : pos + 1200]
+                proj_match = re.search(r'"(proj_[A-Za-z0-9]+)"', window)
+                projects = (
+                    [{"id": proj_match.group(1)}] if proj_match else []
+                )
+                orgs.append({"id": oid, "projects": projects})
+                cursor = pos + 1
+            return orgs
 
         def _build_from_text(text):
             if not text or "workspaces" not in text:
@@ -2463,6 +3044,7 @@ class OAuthClient:
                 "session_id": session_id,
                 "openai_client_id": client_id,
                 "workspaces": workspaces,
+                "orgs": _extract_orgs(normalized),
             }
 
         candidates = [html]
@@ -2482,12 +3064,17 @@ class OAuthClient:
         if '\\"' in html:
             candidates.append(html.replace('\\"', '"'))
 
+        best = None
         for candidate in candidates:
             parsed = _build_from_text(candidate)
-            if parsed and parsed.get("workspaces"):
+            if not parsed or not parsed.get("workspaces"):
+                continue
+            # 优先保留同时带 orgs 的候选；否则返回第一个能解到 workspaces 的
+            if parsed.get("orgs"):
                 return parsed
-
-        return None
+            if best is None:
+                best = parsed
+        return best
 
     def _decode_oauth_session_cookie(self):
         """解码 oai-client-auth-session cookie"""
@@ -2570,7 +3157,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause()
-            r = self.session.post(url, **kwargs)
+            r = self._http("POST", url, **kwargs)
 
             if r.status_code == 200:
                 self._log("token_exchange 成功")
@@ -2609,7 +3196,7 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
 
             self._browser_pause(0.12, 0.25)
-            resp = self.session.post(request_url, **kwargs)
+            resp = self._http("POST", request_url, **kwargs)
         except Exception as e:
             return False, None, f"add-phone/send 异常: {e}"
 
@@ -2667,7 +3254,7 @@ class OAuthClient:
             if impersonate:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.25)
-            resp = self.session.post(request_url, **kwargs)
+            resp = self._http("POST", request_url, **kwargs)
         except Exception as e:
             return False, f"add-phone/send 重发异常: {e}"
 
@@ -2737,7 +3324,7 @@ class OAuthClient:
             if impersonate:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.25)
-            resp = self.session.post(request_url, **kwargs)
+            resp = self._http("POST", request_url, **kwargs)
         except Exception as e:
             return False, None, f"phone-otp/validate 异常: {e}"
 
@@ -2778,7 +3365,10 @@ class OAuthClient:
                 impersonate,
             )
             if not sent or not next_state:
-                self._set_error(detail or "add-phone/send 未返回有效状态")
+                self._set_error(
+                    detail or "add-phone/send 未返回有效状态",
+                    error_code="add_phone_send_failed",
+                )
                 return None
 
             if (
@@ -2790,7 +3380,8 @@ class OAuthClient:
                     self._log(f"add_phone 提交后已进入后续状态: {describe_flow_state(next_state)}")
                     return next_state
                 self._set_error(
-                    f"add-phone/send 未进入手机验证码页: {describe_flow_state(next_state)}"
+                    f"add-phone/send 未进入手机验证码页: {describe_flow_state(next_state)}",
+                    error_code="add_phone_state_unexpected",
                 )
                 return None
 
@@ -2811,18 +3402,23 @@ class OAuthClient:
                         return validated_state
                     self._log(detail or "手机号 OTP 验证失败")
 
-                self._set_error("配置的手机号验证码未通过验证")
+                self._set_error(
+                    "配置的手机号验证码未通过验证",
+                    error_code="add_phone_config_code_invalid",
+                )
                 return None
 
             self._set_error(
-                "已提交配置手机号，但未提供 chatgpt_phone_otp_code，当前流程无法继续"
+                "已提交配置手机号，但未提供 chatgpt_phone_otp_code，当前流程无法继续",
+                error_code="add_phone_config_code_missing",
             )
             return None
 
         phone_service = SMSToMePhoneService(self.config, log_fn=self._log)
         if not phone_service.enabled:
             self._set_error(
-                "当前链路需要手机号验证，但未配置可用的手机号能力（SMSToMe 或固定手机号验证码）"
+                "当前链路需要手机号验证，但未配置可用的手机号能力（SMSToMe 或固定手机号验证码）",
+                error_code="add_phone_capability_missing",
             )
             return None
 
@@ -2931,7 +3527,10 @@ class OAuthClient:
 
             return validated_state
 
-        self._set_error(f"add_phone 阶段失败: {last_failure or '未完成手机号验证'}")
+        self._set_error(
+            f"add_phone 阶段失败: {last_failure or '未完成手机号验证'}",
+            error_code="add_phone_verification_failed",
+        )
         return None
 
     def _handle_otp_verification(
@@ -2985,7 +3584,7 @@ class OAuthClient:
                     if impersonate:
                         kwargs["impersonate"] = impersonate
                     self._browser_pause()
-                    resp = self.session.post(request_url, **kwargs)
+                    resp = self._http("POST", request_url, **kwargs)
                     self._log(f"/passwordless/send-otp -> {resp.status_code}")
                     if resp.status_code == 200:
                         resend_ok = True
@@ -3016,7 +3615,7 @@ class OAuthClient:
                 if impersonate:
                     kwargs["impersonate"] = impersonate
                 self._browser_pause()
-                resp = self.session.get(request_url, **kwargs)
+                resp = self._http("GET", request_url, **kwargs)
                 self._log(f"/email-otp/send -> {resp.status_code}")
                 if resp.status_code == 200:
                     self._log("已触发 email-otp 重发")
@@ -3132,7 +3731,7 @@ class OAuthClient:
                 if impersonate:
                     kwargs["impersonate"] = impersonate
                 self._browser_pause(0.12, 0.25)
-                resp_otp = self.session.post(request_url, **kwargs)
+                resp_otp = self._http("POST", request_url, **kwargs)
             except Exception as e:
                 self._log(f"email-otp/validate 异常: {e}")
                 failed_codes.add(code)
@@ -3291,7 +3890,7 @@ class OAuthClient:
 
         if not self.last_error:
             self._set_error(
-                f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码，等待窗口 {otp_wait_seconds}s"
+                f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码，等待窗口 {otp_wait_seconds}s",
+                error_code="oauth_otp_verification_failed",
             )
         return None
-

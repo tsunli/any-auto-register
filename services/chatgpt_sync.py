@@ -303,6 +303,7 @@ def backfill_chatgpt_account_to_cpa(
     api_url: str | None = None,
     api_key: str | None = None,
     commit: bool = True,
+    force: bool = False,
 ) -> dict[str, Any]:
     from platforms.chatgpt.status_probe import probe_local_chatgpt_status
     from services.cliproxyapi_sync import sync_chatgpt_cliproxyapi_status
@@ -327,7 +328,7 @@ def backfill_chatgpt_account_to_cpa(
             session.refresh(account)
         return {"ok": False, "uploaded": False, "skipped": False, "message": msg, "results": results}
 
-    if not _remote_auth_missing(initial_sync):
+    if not force and not _remote_auth_missing(initial_sync):
         msg = f"远端已存在 ({_remote_state_label(initial_sync)})，跳过上传"
         results.append({"name": "CLIProxyAPI 同步", "ok": True, "msg": msg})
         if session is not None and commit:

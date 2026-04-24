@@ -8,6 +8,7 @@ import uuid
 import time
 from urllib.parse import urlparse
 from core.proxy_utils import build_requests_proxy_config
+from core.task_runtime import SkipCurrentAttemptRequested, TaskInterruption
 
 try:
     from curl_cffi import requests as curl_requests
@@ -35,13 +36,6 @@ from .utils import (
 # Chrome 指纹配置
 _CHROME_PROFILES = [
     {
-        "major": 131,
-        "impersonate": "chrome131",
-        "build": 6778,
-        "patch_range": (69, 205),
-        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    },
-    {
         "major": 133,
         "impersonate": "chrome133a",
         "build": 6943,
@@ -57,16 +51,33 @@ _CHROME_PROFILES = [
     },
 ]
 
+# 平台 UA 模板
+_PLATFORM_TEMPLATES = [
+    {
+        "ua_tpl": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        "platform": '"Windows"',
+        "arch": '"x86"',
+        "platform_version_range": (10, 15),
+    },
+    {
+        "ua_tpl": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        "platform": '"macOS"',
+        "arch": '"arm"',
+        "platform_version_range": (13, 15),
+    },
+]
+
 
 def _random_chrome_version():
-    """随机选择一个 Chrome 版本"""
+    """随机选择一个 Chrome 版本和平台"""
     profile = random.choice(_CHROME_PROFILES)
+    platform = random.choice(_PLATFORM_TEMPLATES)
     major = profile["major"]
     build = profile["build"]
     patch = random.randint(*profile["patch_range"])
     full_ver = f"{major}.0.{build}.{patch}"
-    ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
-    return profile["impersonate"], major, full_ver, ua, profile["sec_ch_ua"]
+    ua = platform["ua_tpl"].format(ver=full_ver)
+    return profile["impersonate"], major, full_ver, ua, profile["sec_ch_ua"], platform
 
 
 class ChatGPTClient:
@@ -88,6 +99,12 @@ class ChatGPTClient:
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
         self.device_id = str(uuid.uuid4())
+        self._session_req_count = 0
+        self._session_born_at = time.time()
+        self._session_max_req = 80
+        self._session_max_age = 240
+        self._ip_cooldown_enabled = True
+        self._ip_cooldown_seconds = 600
         self.accept_language = random.choice(
             [
                 "en-US,en;q=0.9",
@@ -97,56 +114,189 @@ class ChatGPTClient:
             ]
         )
 
-        # 随机 Chrome 版本
+        # 随机 Chrome 版本 + 平台
         (
             self.impersonate,
             self.chrome_major,
             self.chrome_full,
             self.ua,
             self.sec_ch_ua,
+            self._platform,
         ) = _random_chrome_version()
 
         # 创建 session
         self.session = curl_requests.Session(impersonate=self.impersonate)
+        self._configure_session(self.session)
+        self.last_registration_state = FlowState()
+        self.last_stage = ""
+        self.stage_trace = []
+        self.last_token_exchange_error_code = ""
+        self.last_token_exchange_error = ""
 
+    def _configure_session(self, session):
         if self.proxy:
-            self.session.proxies = build_requests_proxy_config(self.proxy)
+            session.proxies = build_requests_proxy_config(self.proxy)
 
-        # 设置基础 headers
-        self.session.headers.update(
+        pv_lo, pv_hi = self._platform.get("platform_version_range", (10, 15))
+        session.headers.update(
             {
                 "User-Agent": self.ua,
                 "Accept-Language": self.accept_language,
                 "sec-ch-ua": self.sec_ch_ua,
                 "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-                "sec-ch-ua-arch": '"x86"',
+                "sec-ch-ua-platform": self._platform["platform"],
+                "sec-ch-ua-arch": self._platform["arch"],
                 "sec-ch-ua-bitness": '"64"',
                 "sec-ch-ua-full-version": f'"{self.chrome_full}"',
-                "sec-ch-ua-platform-version": f'"{random.randint(10, 15)}.0.0"',
+                "sec-ch-ua-platform-version": f'"{random.randint(pv_lo, pv_hi)}.0.0"',
             }
         )
+        seed_oai_device_cookie(session, self.device_id)
 
-        # 设置 oai-did cookie
-        seed_oai_device_cookie(self.session, self.device_id)
-        self.last_registration_state = FlowState()
-        self.last_stage = ""
+    def _recreate_session(self):
+        old_session = getattr(self, "session", None)
+        old_headers = {}
+        old_cookies = None
+        if old_session is not None:
+            try:
+                old_headers = dict(getattr(old_session, "headers", {}) or {})
+            except Exception:
+                old_headers = {}
+            try:
+                old_cookies = getattr(old_session, "cookies", None)
+            except Exception:
+                old_cookies = None
+
+        new_session = curl_requests.Session(impersonate=self.impersonate)
+        self._configure_session(new_session)
+        if old_headers:
+            try:
+                new_session.headers.update(old_headers)
+            except Exception:
+                pass
+        if old_cookies is not None:
+            try:
+                new_session.cookies.update(old_cookies)
+            except Exception:
+                pass
+        try:
+            if old_session is not None:
+                old_session.close()
+        except Exception:
+            pass
+        self.session = new_session
+        self._session_req_count = 0
+        self._session_born_at = time.time()
+
+    def _maybe_rotate_session(self):
+        expired_by_req = self._session_req_count >= self._session_max_req
+        expired_by_age = (time.time() - self._session_born_at) >= self._session_max_age
+        if expired_by_req or expired_by_age:
+            self._log(
+                "session 到期回收: "
+                f"reqs={self._session_req_count}, age={int(time.time() - self._session_born_at)}s"
+            )
+            self._recreate_session()
+
+    def _should_cool_down_proxy(self, response) -> bool:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code in (409, 429):
+            return True
+        if status_code != 403:
+            return False
+        try:
+            text = str(getattr(response, "text", "") or "").lower()
+        except Exception:
+            text = ""
+        cf_markers = (
+            "cloudflare",
+            "just a moment",
+            "cf-ray",
+            "attention required",
+            "__cf_chl",
+            "challenge-platform",
+        )
+        return any(marker in text for marker in cf_markers)
+
+    def _cool_down_current_proxy(self, status_code: int, url: str):
+        if not self._ip_cooldown_enabled or not self.proxy:
+            return
+        try:
+            from core.proxy_pool import proxy_pool as _proxy_pool
+
+            _proxy_pool.cool_down(self.proxy, self._ip_cooldown_seconds)
+            self._log(
+                f"IP 限流 {status_code}，代理冷却 {self._ip_cooldown_seconds}s: {self.proxy}"
+            )
+        except Exception as e:
+            self._log(f"代理冷却失败(忽略): {e}")
+
+    def _http(self, method: str, url: str, *, _retry: bool = False, **kwargs):
+        self._maybe_rotate_session()
+        self._session_req_count += 1
+        try:
+            caller = getattr(self.session, str(method or "").lower(), None)
+            if callable(caller):
+                response = caller(url, **kwargs)
+            else:
+                response = self.session.request(method, url, **kwargs)
+        except TaskInterruption:
+            raise
+        except Exception as e:
+            if self._is_connection_broken(e):
+                if not _retry:
+                    self._log(
+                        f"连接中断({type(e).__name__})，重建 session 后单次重试: {url}"
+                    )
+                    self._recreate_session()
+                    return self._http(method, url, _retry=True, **kwargs)
+                raise SkipCurrentAttemptRequested(
+                    f"session 重建后仍失败: {type(e).__name__}"
+                )
+            raise
+
+        if self._should_cool_down_proxy(response):
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            self._cool_down_current_proxy(status_code, url)
+            raise SkipCurrentAttemptRequested(f"IP 限流 {status_code}，冷却代理")
+        return response
+
+    @staticmethod
+    def _is_connection_broken(exc: BaseException) -> bool:
+        if exc is None:
+            return False
+        name = type(exc).__name__
+        msg = str(exc).lower()
+        if name in {"BrokenPipeError", "ConnectionResetError", "ConnectionAbortedError"}:
+            return True
+        if "requestserror" in name.lower() or "curlerror" in name.lower():
+            return True
+        tokens = (
+            "broken pipe",
+            "connection reset",
+            "connection aborted",
+            "connection closed",
+            "epipe",
+            "ssl: bad",
+        )
+        return any(t in msg for t in tokens)
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
-        prefer_browser = flow in {"username_password_create", "oauth_create_account"}
-        if prefer_browser:
-            token = get_sentinel_token_via_browser(
-                flow=flow,
-                proxy=self.proxy,
-                page_url=page_url,
-                headless=self.browser_mode != "headed",
-                device_id=self.device_id,
-                log_fn=lambda msg: self._log(msg),
-            )
-            if token:
-                self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
-                return token
+        # 所有 flow 优先尝试 Playwright 浏览器方案，
+        # 因为纯 Python 方案缺少 Turnstile `t` 字段，通过率显著低于浏览器方案。
+        token = get_sentinel_token_via_browser(
+            flow=flow,
+            proxy=self.proxy,
+            page_url=page_url,
+            headless=self.browser_mode != "headed",
+            device_id=self.device_id,
+            log_fn=lambda msg: self._log(msg),
+        )
+        if token:
+            self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
+            return token
 
+        # Playwright 不可用时降级到纯 Python PoW（缺少 t 字段，成功率较低）
         token = build_sentinel_token(
             self.session,
             self.device_id,
@@ -156,7 +306,7 @@ class ChatGPTClient:
             impersonate=self.impersonate,
         )
         if token:
-            self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
+            self._log(f"{flow}: 已通过 HTTP PoW 获取 token（降级，缺少 Turnstile t 字段）")
         return token
 
     def _log(self, msg):
@@ -165,12 +315,25 @@ class ChatGPTClient:
             print(f"  {msg}")
 
     def _enter_stage(self, stage: str, detail: str = ""):
+        if not hasattr(self, "stage_trace") or self.stage_trace is None:
+            self.stage_trace = []
         self.last_stage = str(stage or "").strip()
         if self.last_stage:
+            self.stage_trace.append(self.last_stage)
             message = f"[stage={self.last_stage}]"
             if detail:
                 message += f" {detail}"
             self._log(message)
+
+    def _set_token_exchange_error(self, code: str, message: str):
+        if not hasattr(self, "stage_trace") or self.stage_trace is None:
+            self.stage_trace = []
+        self.last_token_exchange_error_code = str(code or "").strip()
+        self.last_token_exchange_error = str(message or "").strip()
+        self.last_stage = "token_exchange"
+        if not self.stage_trace or self.stage_trace[-1] != "token_exchange":
+            self.stage_trace.append("token_exchange")
+        return False, self.last_token_exchange_error
 
     def _browser_pause(self, low=0.15, high=0.45):
         """在 headed 模式下加入轻微停顿，模拟有头浏览器节奏。"""
@@ -218,6 +381,7 @@ class ChatGPTClient:
             self.chrome_full,
             self.ua,
             self.sec_ch_ua,
+            self._platform,
         ) = _random_chrome_version()
         self.accept_language = random.choice(
             [
@@ -229,23 +393,9 @@ class ChatGPTClient:
         )
 
         self.session = curl_requests.Session(impersonate=self.impersonate)
-        if self.proxy:
-            self.session.proxies = build_requests_proxy_config(self.proxy)
-
-        self.session.headers.update(
-            {
-                "User-Agent": self.ua,
-                "Accept-Language": self.accept_language,
-                "sec-ch-ua": self.sec_ch_ua,
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-                "sec-ch-ua-arch": '"x86"',
-                "sec-ch-ua-bitness": '"64"',
-                "sec-ch-ua-full-version": f'"{self.chrome_full}"',
-                "sec-ch-ua-platform-version": f'"{random.randint(10, 15)}.0.0"',
-            }
-        )
-        seed_oai_device_cookie(self.session, self.device_id)
+        self._configure_session(self.session)
+        self._session_req_count = 0
+        self._session_born_at = time.time()
 
     def _state_from_url(self, url, method="GET"):
         state = extract_flow_state(
@@ -276,13 +426,16 @@ class ChatGPTClient:
         current_url = (state.current_url or "").lower()
         continue_url = (state.continue_url or "").lower()
         page_type = state.page_type or ""
+        # external_url 需要先导航到目标 URL 才能判定完成，
+        # 否则 session cookie 不会落地。
+        if page_type == "external_url":
+            return False
         return (
             page_type in {"callback", "chatgpt_home", "oauth_callback"}
             or ("chatgpt.com" in current_url and "redirect_uri" not in current_url)
             or (
                 "chatgpt.com" in continue_url
                 and "redirect_uri" not in continue_url
-                and page_type != "external_url"
             )
         )
 
@@ -318,17 +471,14 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.get(
+            r = self._http("GET", target_url, headers=self._headers(
                 target_url,
-                headers=self._headers(
-                    target_url,
-                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    referer=referer,
-                    navigation=True,
-                ),
-                allow_redirects=True,
-                timeout=30,
-            )
+                accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                referer=referer,
+                navigation=True,
+            ),
+            allow_redirects=True,
+            timeout=30,)
             final_url = str(r.url)
             self._log(f"follow -> {r.status_code} {final_url}")
 
@@ -345,18 +495,44 @@ class ChatGPTClient:
 
             self._log(f"follow state -> {describe_flow_state(next_state)}")
             return True, next_state
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"跟随 continue_url 失败: {e}")
             return False, str(e)
 
     def _get_cookie_value(self, name, domain_hint=None):
-        """读取当前会话中的 Cookie。"""
-        for cookie in self.session.cookies.jar:
-            if cookie.name != name:
-                continue
+        """读取当前会话中的 Cookie（兼容 next-auth 分片 cookie）。"""
+        try:
+            cookie_jar = self.session.cookies.jar
+        except Exception:
+            return ""
+
+        exact_value = ""
+        chunk_prefix = f"{name}."
+        chunk_parts = {}
+
+        for cookie in cookie_jar:
             if domain_hint and domain_hint not in (cookie.domain or ""):
                 continue
-            return cookie.value
+            if cookie.name == name:
+                exact_value = cookie.value
+                if exact_value:
+                    return exact_value
+                continue
+            if not cookie.name.startswith(chunk_prefix):
+                continue
+            chunk_idx = cookie.name[len(chunk_prefix):]
+            if not chunk_idx.isdigit():
+                continue
+            idx = int(chunk_idx)
+            if idx not in chunk_parts:
+                chunk_parts[idx] = cookie.value
+
+        if exact_value:
+            return exact_value
+        if chunk_parts:
+            return "".join(value for _, value in sorted(chunk_parts.items()))
         return ""
 
     def get_next_auth_session_token(self):
@@ -374,16 +550,15 @@ class ChatGPTClient:
         for attempt in range(max(1, int(max_attempts or 1))):
             try:
                 self._browser_pause()
-                response = self.session.get(
+                response = self._http("GET", url, headers=self._headers(
                     url,
-                    headers=self._headers(
-                        url,
-                        accept="application/json",
-                        referer=f"{self.BASE}/",
-                        fetch_site="same-origin",
-                    ),
-                    timeout=30,
-                )
+                    accept="application/json",
+                    referer=f"{self.BASE}/",
+                    fetch_site="same-origin",
+                ),
+                timeout=30,)
+            except TaskInterruption:
+                raise
             except Exception as exc:
                 last_error = f"/api/auth/session 请求异常: {exc}"
                 if attempt < max_attempts - 1:
@@ -430,17 +605,16 @@ class ChatGPTClient:
                     f"({attempt + 1}/{max_attempts})"
                 )
                 try:
-                    self.session.get(
+                    self._http("GET", f"{self.BASE}/", headers=self._headers(
                         f"{self.BASE}/",
-                        headers=self._headers(
-                            f"{self.BASE}/",
-                            accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            referer=f"{self.BASE}/",
-                            navigation=True,
-                        ),
-                        allow_redirects=True,
-                        timeout=30,
-                    )
+                        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        referer=f"{self.BASE}/",
+                        navigation=True,
+                    ),
+                    allow_redirects=True,
+                    timeout=30,)
+                except TaskInterruption:
+                    raise
                 except Exception:
                     pass
                 time.sleep(retry_delay)
@@ -458,6 +632,8 @@ class ChatGPTClient:
             tuple[bool, dict|str]: 成功时返回标准化 token/session 数据；失败时返回错误信息。
         """
         self._enter_stage("token_exchange", "reuse session -> /api/auth/session")
+        self.last_token_exchange_error_code = ""
+        self.last_token_exchange_error = ""
         state = self.last_registration_state or FlowState()
         self._log("步骤 1/4: 跟随注册回调 external_url ...")
         if state.page_type == "external_url" or self._state_requires_navigation(state):
@@ -466,12 +642,24 @@ class ChatGPTClient:
                 referer=state.current_url or f"{self.AUTH}/about-you",
             )
             if not ok:
-                return False, f"注册回调落地失败: {followed}"
+                return self._set_token_exchange_error(
+                    "callback_not_landed",
+                    f"注册回调落地失败: {followed}",
+                )
             self.last_registration_state = followed
         else:
             self._log("注册回调已落地，跳过额外跟随")
 
         self._log("步骤 2/4: 检查 __Secure-next-auth.session-token ...")
+        try:
+            chatgpt_cookies = [
+                f"{c.name}@{c.domain}"
+                for c in self.session.cookies.jar
+                if "chatgpt.com" in (c.domain or "")
+            ]
+            self._log(f"[diag] chatgpt.com 域 cookies: {chatgpt_cookies}")
+        except Exception as _diag_exc:
+            self._log(f"[diag] cookie 快照失败: {_diag_exc}")
         session_cookie = ""
         for attempt in range(5):
             session_cookie = self.get_next_auth_session_token()
@@ -483,27 +671,33 @@ class ChatGPTClient:
             )
             try:
                 self._browser_pause(0.2, 0.5)
-                self.session.get(
+                self._http("GET", f"{self.BASE}/", headers=self._headers(
                     f"{self.BASE}/",
-                    headers=self._headers(
-                        f"{self.BASE}/",
-                        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        referer=state.current_url or f"{self.AUTH}/about-you",
-                        navigation=True,
-                    ),
-                    allow_redirects=True,
-                    timeout=30,
-                )
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer=state.current_url or f"{self.AUTH}/about-you",
+                    navigation=True,
+                ),
+                allow_redirects=True,
+                timeout=30,)
+            except TaskInterruption:
+                raise
             except Exception as exc:
                 self._log(f"补触达 ChatGPT 首页异常: {exc}")
             time.sleep(1.0)
         if not session_cookie:
-            return False, "缺少 ChatGPT session-token，注册回调可能未完全落地"
+            return self._set_token_exchange_error(
+                "session_cookie_missing",
+                "缺少 ChatGPT session-token，注册回调可能未完全落地",
+            )
 
         self._log("步骤 3/4: 请求 ChatGPT /api/auth/session ...")
         ok, session_or_error = self.fetch_chatgpt_session()
         if not ok:
-            return False, session_or_error
+            error_text = str(session_or_error or "").strip()
+            error_code = "auth_session_fetch_failed"
+            if "未返回 accessToken" in error_text:
+                error_code = "auth_session_missing_access_token"
+            return self._set_token_exchange_error(error_code, error_text)
 
         session_data = session_or_error
         access_token = str(session_data.get("accessToken") or "").strip()
@@ -551,17 +745,16 @@ class ChatGPTClient:
         url = f"{self.BASE}/"
         try:
             self._browser_pause()
-            r = self.session.get(
+            r = self._http("GET", url, headers=self._headers(
                 url,
-                headers=self._headers(
-                    url,
-                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    navigation=True,
-                ),
-                allow_redirects=True,
-                timeout=30,
-            )
+                accept="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                navigation=True,
+            ),
+            allow_redirects=True,
+            timeout=30,)
             return r.status_code == 200
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"访问首页失败: {e}")
             return False
@@ -571,16 +764,13 @@ class ChatGPTClient:
         self._log("获取 CSRF token...")
         url = f"{self.BASE}/api/auth/csrf"
         try:
-            r = self.session.get(
+            r = self._http("GET", url, headers=self._headers(
                 url,
-                headers=self._headers(
-                    url,
-                    accept="application/json",
-                    referer=f"{self.BASE}/",
-                    fetch_site="same-origin",
-                ),
-                timeout=30,
-            )
+                accept="application/json",
+                referer=f"{self.BASE}/",
+                fetch_site="same-origin",
+            ),
+            timeout=30,)
 
             if r.status_code == 200:
                 data = r.json()
@@ -588,6 +778,8 @@ class ChatGPTClient:
                 if token:
                     self._log(f"CSRF token: {token[:20]}...")
                     return token
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"获取 CSRF token 失败: {e}")
 
@@ -619,20 +811,17 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.post(
+            r = self._http("POST", url, params=params,
+            data=form_data,
+            headers=self._headers(
                 url,
-                params=params,
-                data=form_data,
-                headers=self._headers(
-                    url,
-                    accept="application/json",
-                    referer=f"{self.BASE}/",
-                    origin=self.BASE,
-                    content_type="application/x-www-form-urlencoded",
-                    fetch_site="same-origin",
-                ),
-                timeout=30,
-            )
+                accept="application/json",
+                referer=f"{self.BASE}/",
+                origin=self.BASE,
+                content_type="application/x-www-form-urlencoded",
+                fetch_site="same-origin",
+            ),
+            timeout=30,)
 
             if r.status_code == 200:
                 data = r.json()
@@ -640,6 +829,8 @@ class ChatGPTClient:
                 if authorize_url:
                     self._log(f"获取到 authorize URL")
                     return authorize_url
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"提交邮箱失败: {e}")
 
@@ -664,22 +855,21 @@ class ChatGPTClient:
                     self._log("访问 authorize URL...")
 
                 self._browser_pause()
-                r = self.session.get(
+                r = self._http("GET", url, headers=self._headers(
                     url,
-                    headers=self._headers(
-                        url,
-                        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        referer=f"{self.BASE}/",
-                        navigation=True,
-                    ),
-                    allow_redirects=True,
-                    timeout=30,
-                )
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer=f"{self.BASE}/",
+                    navigation=True,
+                ),
+                allow_redirects=True,
+                timeout=30,)
 
                 final_url = str(r.url)
                 self._log(f"重定向到: {final_url}")
                 return final_url
 
+            except TaskInterruption:
+                raise
             except Exception as e:
                 error_msg = str(e)
                 is_tls_error = (
@@ -745,7 +935,7 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            r = self._http("POST", url, json=payload, headers=headers, timeout=30)
 
             if r.status_code == 200:
                 data = r.json()
@@ -761,6 +951,8 @@ class ChatGPTClient:
                 self._log(f"注册失败: {r.status_code} - {error_msg}")
                 return False, f"HTTP {r.status_code}: {error_msg}"
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"注册异常: {e}")
             return False, str(e)
@@ -773,17 +965,14 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.get(
+            r = self._http("GET", url, headers=self._headers(
                 url,
-                headers=self._headers(
-                    url,
-                    accept="application/json, text/plain, */*",
-                    referer=referer or f"{self.AUTH}/create-account/password",
-                    fetch_site="same-origin",
-                ),
-                allow_redirects=True,
-                timeout=30,
-            )
+                accept="application/json, text/plain, */*",
+                referer=referer or f"{self.AUTH}/create-account/password",
+                fetch_site="same-origin",
+            ),
+            allow_redirects=True,
+            timeout=30,)
             self._log(f"验证码发送状态: {r.status_code}")
             if r.status_code != 200:
                 self._log(f"验证码发送失败响应: {r.text[:180]}")
@@ -801,6 +990,8 @@ class ChatGPTClient:
             else:
                 self._log("验证码发送响应: 非 JSON（按已触发处理）")
             return True
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"发送验证码失败: {e}")
             return False
@@ -833,7 +1024,7 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            r = self._http("POST", url, json=payload, headers=headers, timeout=30)
 
             if r.status_code == 200:
                 try:
@@ -851,6 +1042,8 @@ class ChatGPTClient:
                 self._log(f"验证失败: {r.status_code} - {error_msg}")
                 return False, f"HTTP {r.status_code}"
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"验证异常: {e}")
             return False, str(e)
@@ -903,7 +1096,7 @@ class ChatGPTClient:
 
         try:
             self._browser_pause()
-            r = self.session.post(url, json=payload, headers=headers, timeout=30)
+            r = self._http("POST", url, json=payload, headers=headers, timeout=30)
 
             if r.status_code == 200:
                 try:
@@ -936,6 +1129,8 @@ class ChatGPTClient:
                 self._log(f"创建失败: {detail} - {error_msg[:200]}")
                 return False, detail
 
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._log(f"创建异常: {e}")
             return False, str(e)
@@ -975,9 +1170,9 @@ class ChatGPTClient:
         )
 
         try:
-            otp_wait_timeout = max(30, int(otp_wait_timeout or 600))
+            otp_wait_timeout = max(30, int(otp_wait_timeout or 300))
         except Exception:
-            otp_wait_timeout = 600
+            otp_wait_timeout = 300
         try:
             otp_resend_wait_timeout = max(30, int(otp_resend_wait_timeout or 300))
         except Exception:
@@ -1028,6 +1223,9 @@ class ChatGPTClient:
                     f"检测到 Cloudflare/SPA 中间页，准备重试预授权: {final_url[:160]}..."
                 )
                 if auth_attempt < max_auth_attempts - 1:
+                    backoff = min(2 ** (auth_attempt + 1), 10)
+                    self._log(f"等待 {backoff}s 后重试预授权...")
+                    time.sleep(backoff)
                     continue
                 return False, f"预授权被拦截: {final_path}"
 

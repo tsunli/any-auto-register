@@ -18,19 +18,26 @@ logger = logging.getLogger(__name__)
 
 class EmailServiceAdapter:
     """\u5c06 V1 \u7684 email_service \u9002\u914d\u6210 V2 \u6240\u9700\u7684\u63a5\u7801\u63a5\u53e3\u3002"""
-    def __init__(self, email_service, email, log_fn):
+    def __init__(self, email_service, email, log_fn, default_timeout: int = 120):
         self.es = email_service
         self.email = email
         self.log_fn = log_fn
         self._used_codes = set()
+        try:
+            self.default_timeout = max(30, int(default_timeout or 120))
+        except (TypeError, ValueError):
+            self.default_timeout = 120
 
-    def wait_for_verification_code(self, email, timeout=60, otp_sent_at=None, exclude_codes=None):
+    def wait_for_verification_code(self, email, timeout=None, otp_sent_at=None, exclude_codes=None):
+        if timeout is None:
+            timeout = self.default_timeout
         msg = f"\u6b63\u5728\u7b49\u5f85\u90ae\u7bb1 {email} \u7684\u9a8c\u8bc1\u7801 ({timeout}s)..."
         self.log_fn(msg)
+        excluded = set(exclude_codes or set()) | set(self._used_codes)
         code = self.es.get_verification_code(
             timeout=timeout,
             otp_sent_at=otp_sent_at,
-            exclude_codes=None,
+            exclude_codes=excluded,
         )
         if code:
             self._used_codes.add(code)
@@ -55,6 +62,7 @@ class AccessTokenOnlyRegistrationEngine:
         self.task_uuid = task_uuid
         self.max_retries = max(1, int(max_retries or 1))
         self.extra_config = dict(extra_config or {})
+        self.last_error_metadata = {}
         
         self.email = None
         self.password = None
@@ -94,10 +102,29 @@ class AccessTokenOnlyRegistrationEngine:
         ]
         return any(marker.lower() in text for marker in retriable_markers)
 
+    @staticmethod
+    def _build_stage_metadata(
+        chatgpt_client,
+        *,
+        error_code: str = "",
+        extra: Optional[dict] = None,
+    ) -> dict:
+        payload = {
+            "last_stage": getattr(chatgpt_client, "last_stage", ""),
+            "stages_trace": list(getattr(chatgpt_client, "stage_trace", []) or []),
+            "error_code": str(error_code or "").strip(),
+            "registration_flow": "chatgpt_client.register_complete_flow",
+            "token_flow": "chatgpt_client.reuse_session_and_get_tokens",
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
         try:
             last_error = ""
+            chatgpt_client = None
             for attempt in range(self.max_retries):
                 try:
                     if attempt == 0:
@@ -129,7 +156,18 @@ class AccessTokenOnlyRegistrationEngine:
                     self._log(f"注册信息: {first_name} {last_name}, 生日: {birthdate}")
 
                     # 使用包装器为底层客户端提供接码服务
-                    skymail_adapter = EmailServiceAdapter(self.email_service, email_addr, self._log)
+                    otp_timeout_default = (
+                        self.extra_config.get("mailbox_otp_timeout_seconds")
+                        or self.extra_config.get("email_otp_timeout_seconds")
+                        or self.extra_config.get("otp_timeout")
+                        or 120
+                    )
+                    skymail_adapter = EmailServiceAdapter(
+                        self.email_service,
+                        email_addr,
+                        self._log,
+                        default_timeout=otp_timeout_default,
+                    )
 
                     # 2. 初始化 V2 客户端
                     chatgpt_client = ChatGPTClient(
@@ -147,6 +185,7 @@ class AccessTokenOnlyRegistrationEngine:
 
                     if not success:
                         last_error = f"注册流失败: {msg}"
+                        result.metadata = self._build_stage_metadata(chatgpt_client)
                         if attempt < self.max_retries - 1 and self._should_retry(msg):
                             self._log(f"注册流失败，准备整流程重试: {msg}")
                             continue
@@ -167,13 +206,16 @@ class AccessTokenOnlyRegistrationEngine:
                             or ("v2_acct_" + chatgpt_client.device_id[:8])
                         )
                         result.workspace_id = session_result.get("workspace_id", "")
-                        result.metadata = {
-                            "auth_provider": session_result.get("auth_provider", ""),
-                            "expires": session_result.get("expires", ""),
-                            "user_id": session_result.get("user_id", ""),
-                            "user": session_result.get("user") or {},
-                            "account": session_result.get("account") or {},
-                        }
+                        result.metadata = self._build_stage_metadata(
+                            chatgpt_client,
+                            extra={
+                                "auth_provider": session_result.get("auth_provider", ""),
+                                "expires": session_result.get("expires", ""),
+                                "user_id": session_result.get("user_id", ""),
+                                "user": session_result.get("user") or {},
+                                "account": session_result.get("account") or {},
+                            },
+                        )
 
                         if result.workspace_id:
                             self._log(f"Session Workspace ID: {result.workspace_id}")
@@ -184,12 +226,25 @@ class AccessTokenOnlyRegistrationEngine:
                         return result
 
                     last_error = f"注册成功，但复用会话获取 AccessToken 失败: {session_result}"
+                    result.metadata = self._build_stage_metadata(
+                        chatgpt_client,
+                        error_code=getattr(
+                            chatgpt_client, "last_token_exchange_error_code", ""
+                        ),
+                    )
                     if attempt < self.max_retries - 1:
                         self._log(f"{last_error}，准备整流程重试")
                         continue
                     result.error_message = last_error
                     return result
                 except TaskInterruption:
+                    if chatgpt_client is not None:
+                        self.last_error_metadata = self._build_stage_metadata(
+                            chatgpt_client,
+                            error_code=getattr(
+                                chatgpt_client, "last_token_exchange_error_code", ""
+                            ),
+                        )
                     raise
                 except Exception as attempt_error:
                     last_error = str(attempt_error)
@@ -207,6 +262,8 @@ class AccessTokenOnlyRegistrationEngine:
             self._log(f"无 RT 注册全流程执行异常: {e}", "error")
             import traceback
             traceback.print_exc()
+            if not result.metadata:
+                result.metadata = {}
             result.error_message = str(e)
             return result
 
