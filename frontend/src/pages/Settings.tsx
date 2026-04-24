@@ -274,6 +274,17 @@ const TAB_ITEMS = [
     icon: <ApiOutlined />,
     sections: [
       {
+        title: '注册稳定性',
+        desc: '控制 ChatGPT 注册任务的熔断与会话回收策略',
+        fields: [
+          { key: 'consecutive_fail_threshold', label: '默认连续失败熔断', placeholder: '15，0 = 禁用' },
+          { key: 'chatgpt_oauth_session_max_requests', label: 'OAuth Session 最大请求数', placeholder: '80' },
+          { key: 'chatgpt_oauth_session_max_age_seconds', label: 'OAuth Session 最大寿命（秒）', placeholder: '240' },
+          { key: 'chatgpt_ip_cooldown_enabled', label: '启用 IP 冷却', type: 'boolean' },
+          { key: 'chatgpt_ip_cooldown_seconds', label: 'IP 冷却秒数', placeholder: '600' },
+        ],
+      },
+      {
         title: 'CPA 面板',
         desc: '注册完成后自动上传到 CPA 管理平台',
         fields: [
@@ -1687,6 +1698,7 @@ export default function Settings() {
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       data.cfworker_random_name_subdomain = parseBooleanConfigValue(data.cfworker_random_name_subdomain)
+      data.chatgpt_ip_cooldown_enabled = parseBooleanConfigValue(data.chatgpt_ip_cooldown_enabled)
       data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
       if (configMailProvider === 'applemail') {
         data.mail_import_source = 'applemail'
@@ -1757,6 +1769,7 @@ export default function Settings() {
       values.sub2api_enabled = parseBooleanConfigValue(values.sub2api_enabled)
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
+      values.chatgpt_ip_cooldown_enabled = parseBooleanConfigValue(values.chatgpt_ip_cooldown_enabled)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
@@ -1772,6 +1785,7 @@ export default function Settings() {
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
+        chatgpt_ip_cooldown_enabled: values.chatgpt_ip_cooldown_enabled,
         cfworker_random_subdomain: values.cfworker_random_subdomain,
         cfworker_random_name_subdomain: values.cfworker_random_name_subdomain,
         contribution_enabled: values.contribution_enabled,

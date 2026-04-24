@@ -45,9 +45,11 @@ export default function RegisterTaskPage() {
       const currentPlatform = form.getFieldValue('platform') || 'trae'
       const configMailProvider = String(cfg.mail_provider || 'luckmail')
       const isMailImportProvider = configMailProvider === 'microsoft' || configMailProvider === 'outlook' || configMailProvider === 'applemail'
+      const defaultExecutor = cfg.default_executor_type || cfg.default_executor || 'protocol'
       form.setFieldsValue({
-        executor_type: normalizeExecutorForPlatform(currentPlatform, cfg.default_executor),
+        executor_type: normalizeExecutorForPlatform(currentPlatform, defaultExecutor),
         captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
+        consecutive_fail_threshold: Number(cfg.consecutive_fail_threshold || 15),
         mail_provider: isMailImportProvider ? 'mail_import' : configMailProvider,
         mail_import_source: configMailProvider === 'applemail' ? 'applemail' : 'microsoft',
         applemail_base_url: cfg.applemail_base_url || 'https://www.appleemail.top',
@@ -102,6 +104,10 @@ export default function RegisterTaskPage() {
         smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds || '',
         smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds || '',
         smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country || '',
+        chatgpt_oauth_session_max_requests: cfg.chatgpt_oauth_session_max_requests || '80',
+        chatgpt_oauth_session_max_age_seconds: cfg.chatgpt_oauth_session_max_age_seconds || '240',
+        chatgpt_ip_cooldown_enabled: parseBooleanConfigValue(cfg.chatgpt_ip_cooldown_enabled || '1'),
+        chatgpt_ip_cooldown_seconds: cfg.chatgpt_ip_cooldown_seconds || '600',
         luckmail_base_url: cfg.luckmail_base_url || 'https://mails.luckyous.com/',
         luckmail_api_key: cfg.luckmail_api_key || '',
         luckmail_email_type: cfg.luckmail_email_type || '',
@@ -191,6 +197,7 @@ export default function RegisterTaskPage() {
         count: values.count,
         concurrency: values.concurrency,
         register_delay_seconds: values.register_delay_seconds || 0,
+        consecutive_fail_threshold: values.consecutive_fail_threshold ?? 15,
         proxy: values.proxy || null,
         executor_type: values.executor_type,
         captcha_solver: values.captcha_solver,
@@ -253,6 +260,7 @@ export default function RegisterTaskPage() {
         count: 1,
         concurrency: 1,
         register_delay_seconds: 0,
+        consecutive_fail_threshold: 15,
         maliapi_base_url: 'https://maliapi.215.im/v1',
         maliapi_auto_domain_strategy: 'balanced',
         solver_url: 'http://localhost:8889',
@@ -295,6 +303,11 @@ export default function RegisterTaskPage() {
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" style={{ flex: 1 }}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0" />
             </Form.Item>
+            <Form.Item name="consecutive_fail_threshold" label="连续失败熔断" style={{ flex: 1 }}>
+              <InputNumber min={0} step={1} style={{ width: '100%' }} placeholder="15，0=禁用" />
+            </Form.Item>
+          </Space>
+          <Space style={{ width: '100%' }}>
             <Form.Item name="proxy" label="代理 (可选)" style={{ flex: 1 }}>
               <Input placeholder="http://user:pass@host:port" />
             </Form.Item>

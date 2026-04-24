@@ -561,6 +561,17 @@ export default function Accounts() {
     })
   }, [detailModalOpen, currentAccount, detailForm])
 
+  useEffect(() => {
+    if (!registerModalOpen) return
+    apiFetch('/config')
+      .then((cfg) => {
+        registerForm.setFieldsValue({
+          consecutive_fail_threshold: Number(cfg.consecutive_fail_threshold || 15),
+        })
+      })
+      .catch(() => {})
+  }, [registerModalOpen, registerForm])
+
   const load = useCallback(async () => {
     if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
       message.warning('开始时间不能晚于结束时间')
@@ -731,7 +742,7 @@ export default function Accounts() {
     setRegisterLoading(true)
     try {
       const cfg = await apiFetch('/config')
-      const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor)
+      const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor_type || cfg.default_executor || 'protocol')
       const registerExtra = {
         mail_provider: cfg.mail_provider || 'luckmail',
         applemail_base_url: cfg.applemail_base_url,
@@ -805,6 +816,7 @@ export default function Accounts() {
           count: values.count,
           concurrency: values.concurrency,
           register_delay_seconds: values.register_delay_seconds || 0,
+          consecutive_fail_threshold: values.consecutive_fail_threshold ?? 15,
           executor_type: executorType,
           captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
           proxy: null,
@@ -1377,6 +1389,13 @@ export default function Accounts() {
             </Form.Item>
             <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
               <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
+            </Form.Item>
+            <Form.Item
+              name="consecutive_fail_threshold"
+              label="连续失败熔断"
+              initialValue={15}
+            >
+              <InputNumber min={0} step={1} style={{ width: '100%' }} placeholder="15，0 = 禁用" />
             </Form.Item>
             {currentPlatform === 'chatgpt' && (
               <Form.Item label="ChatGPT Token 方案">
